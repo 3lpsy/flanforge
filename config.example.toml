@@ -1,0 +1,103 @@
+[logging]
+level = "info"
+# Environment strings use ${KEY} or ${KEY:-default}; ~ resolves from HOME.
+# path = "${FLANFORGE_LOG_PATH:-~/Library/Logs/flanforged/flanforged.log}"
+
+[server]
+listen = "127.0.0.1:9843"
+request_body_limit_bytes = 4096
+allocation_wait_seconds = 600
+shutdown_grace_seconds = 30
+
+[oidc]
+issuer = "https://git.example.com/api/actions"
+audience = "flanforged"
+jwks_url = "https://git.example.com/api/actions/.well-known/keys"
+jwks_cache_seconds = 300
+clock_skew_seconds = 30
+
+[forgejo]
+api_url = "https://git.example.com/api/v1/"
+api_token_file = "~/Library/Application Support/flanforge/api-token"
+http_timeout_seconds = 15
+
+[runtime]
+state_dir = "~/Library/Application Support/flanforge/state"
+tart_path = "/opt/homebrew/bin/tart"
+ssh_path = "/usr/bin/ssh"
+scp_path = "/usr/bin/scp"
+forgejo_runner_host_path = "~/Library/Application Support/flanforge/bin/forgejo-runner"
+# Explicit ownership boundary: exact allocation names below it may be deleted.
+vm_prefix = "ci-"
+# Tart's VM library. Required by warm templates and by the sweep, which ages a
+# VM from its directory and refuses to guess where that directory is.
+tart_home = "~/.tart"
+max_running_vms = 2
+poll_seconds = 2
+# Unreferenced clone and image sweep; 0 disables it. Needs tart_home above.
+reap_interval_hours = 168
+# Declare both to admit a second guest within what the host can afford.
+# host_cpu_count = 16
+# host_memory_mb = 32768
+
+[guest]
+ssh_user = "runner"
+ssh_identity_file = "~/Library/Application Support/flanforge/guest-ssh-key"
+ssh_known_hosts_file = "~/Library/Application Support/flanforge/known_hosts"
+ssh_host_key_alias = "flanforge-tart-guest"
+forgejo_runner_path = "/Users/runner/bin/forgejo-runner"
+ssh_connect_timeout_seconds = 5
+# Set to false only for bring-up, before the template host key is recorded: the
+# two settings above are then unused and an on-path attacker between host and
+# guest can impersonate the guest. The daemon warns at every startup.
+verify_host_key = true
+
+[tailscale]
+# Optional per-allocation Headscale/Tailscale enrollment; disabled by default.
+enabled = false
+# preauth_key_file = "${FLANFORGE_TAILSCALE_PREAUTH_KEY_FILE}"
+# login_server = "${FLANFORGE_TAILSCALE_LOGIN_SERVER:-https://headscale.example}"
+# hostname = "ci-guest"
+# Parsed into arguments without shell evaluation.
+extra_args = ""
+
+[profiles.halogen]
+repository = "owner/halogen"
+template = "flanforge-base"
+runner_label = "macos-tart-halogen"
+job_name = "apple-build"
+allowed_workflows = ["apple.yml"]
+allowed_events = ["push", "workflow_dispatch"]
+allowed_refs = ["refs/heads/main"]
+allowed_ref_prefixes = ["refs/tags/v"]
+require_protected_ref = true
+network = "softnet"
+cpu_count = 4
+memory_mb = 8192
+boot_timeout_seconds = 300
+idle_timeout_seconds = 600
+job_timeout_seconds = 7200
+cleanup_timeout_seconds = 120
+# Opt into warm bases: the image consumers clone, and the only workflow that
+# may produce it. Both or neither; runtime.tart_home is then required.
+# warm_template = "halogen-warm"
+# regeneration_workflow = "warm.yml"
+reap = true
+
+[profiles.liftfg]
+repository = "owner/liftfg"
+template = "flanforge-base"
+runner_label = "macos-tart-liftfg"
+job_name = "apple-build"
+allowed_workflows = ["apple.yml"]
+allowed_events = ["push", "workflow_dispatch"]
+allowed_refs = ["refs/heads/main"]
+allowed_ref_prefixes = ["refs/tags/v"]
+require_protected_ref = true
+network = "softnet"
+cpu_count = 4
+memory_mb = 8192
+boot_timeout_seconds = 300
+idle_timeout_seconds = 600
+job_timeout_seconds = 7200
+cleanup_timeout_seconds = 120

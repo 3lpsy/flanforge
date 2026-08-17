@@ -1,0 +1,21 @@
+/target/
+config.toml
+
+# Release assets fetched by `just fj-download*`.
+/flanforged
+/flanforged-darwin-arm64
+/flanforged-darwin-arm64.sha256
+/forgejo-runner-*-darwin-arm64
+/forgejo-runner-*-darwin-arm64.sha256
+*.log
+.DS_Store
+.env
+__pycache__
+
+/data/dev/run/
+/data/tests/run/
+/data/tmp
+*.db
+*.db-wal
+*.db-shm
+

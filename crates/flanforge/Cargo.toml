@@ -1,0 +1,39 @@
+[package]
+name = "flanforge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "flanforged"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+flanforge-auth = { workspace = true }
+flanforge-cli = { workspace = true }
+flanforge-config = { workspace = true }
+flanforge-core = { workspace = true }
+flanforge-forgejo = { workspace = true }
+flanforge-logging = { workspace = true }
+flanforge-manager = { workspace = true }
+flanforge-router = { workspace = true }
+flanforge-routes = { workspace = true }
+flanforge-runtime = { workspace = true }
+flanforge-store = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+flanforge-test-support = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true }
+
+[lints]
+workspace = true

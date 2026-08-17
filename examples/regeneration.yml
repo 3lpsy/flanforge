@@ -1,0 +1,132 @@
+# Rebuilds this project's base image. The daemon retains this run's guest as
+# the image every interactive workflow clones, so their caches start warm.
+# Nothing here ships: no release, no artifacts.
+#
+# Copy into a consumer repository and name it in the profile's
+# `regeneration_workflow`. See docs/PROFILE_BASE.md.
+name: regeneration
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+# Forgejo's key for OIDC identity tokens. It does not implement GitHub's
+# `permissions: id-token: write`, and without this no token endpoint exists.
+enable-openid-connect: true
+
+concurrency:
+  group: regeneration
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  allocate-macos:
+    runs-on: linux-runner-label
+    timeout-minutes: 70
+    outputs:
+      runner_label: ${{ steps.allocate.outputs.runner_label }}
+      allocation_id: ${{ steps.allocate.outputs.allocation_id }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Request a macOS allocation
+        id: allocate
+        env:
+          FLANFORGED_URL: ${{ vars.FLANFORGED_URL }}
+          FLANFORGE_PROFILE: myproject
+          # Deliberately not warm: regeneration builds the caches, so it must
+          # start from the trusted base rather than the image it replaces.
+          FLANFORGE_WAIT: 3600
+        run: node ci/allocator.js allocate
+
+  # `name` must equal the profile's `job_name`: the daemon binds the guest
+  # runner to exactly one waiting job with this name and run attempt.
+  apple-build:
+    name: apple-build
+    needs: allocate-macos
+    runs-on: ${{ needs.allocate-macos.outputs.runner_label }}
+    timeout-minutes: 120
+    env:
+      # Absolute, stable paths. The runner checks out into a different
+      # directory every run, so anything keyed to the checkout is worthless to
+      # the next job — and the checkout is deleted before promotion, so a cache
+      # written under it never reaches the image at all.
+      CARGO_HOME: /Users/runner/.cargo
+      CARGO_TARGET_DIR: /Users/runner/.cache/myproject-target
+      SCCACHE_DIR: /Users/runner/.cache/sccache
+      SCCACHE_CACHE_SIZE: 20G
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: 0
+      # Absolute paths are not enough on their own: cargo keys workspace units
+      # on the package's absolute path, and Xcode keys incremental state,
+      # module caches and the compilation cache on absolute paths too. Build
+      # from a fixed directory rather than the per-run checkout.
+      WORK_DIR: /Users/runner/build/myproject
+      # No window server session in the guest.
+      HEADLESS: 1
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Prepare the cache directories
+        run: |
+          set -euo pipefail
+          # An sccache server inherited from the image aborts every build, and
+          # a retained image is where one survives.
+          sccache --stop-server >/dev/null 2>&1 || true
+          mkdir -p "${CARGO_TARGET_DIR}" "${SCCACHE_DIR}"
+          sccache --zero-stats >/dev/null 2>&1 || true
+
+      # git, not a copy: `checkout --force` rewrites only files whose blob
+      # changed, so unchanged files keep their mtime. `cp` and `rsync -a` reset
+      # every mtime, which invalidates incremental state as surely as a moving
+      # path does. Fetch by filesystem path with no named remote, so no
+      # credential is ever written into a directory the strip does not cover.
+      - name: Mirror the checkout into the stable build directory
+        run: |
+          set -euo pipefail
+          mkdir -p "${WORK_DIR}"
+          [ -d "${WORK_DIR}/.git" ] || git -C "${WORK_DIR}" init -q
+          git -C "${WORK_DIR}" -c gc.auto=0 fetch -q --no-tags --force "${PWD}" HEAD
+          git -C "${WORK_DIR}" checkout -q --force --detach FETCH_HEAD
+          git -C "${WORK_DIR}" clean -qfd   # no -x: build outputs are the cache
+
+      # Build what the interactive workflows build, so their caches hit. Adding
+      # more here costs scheduled time and saves interactive time. Warming a
+      # configuration nobody else builds costs time and saves none: match the
+      # configuration, platform and targets the interactive jobs use.
+      - name: Warm the caches
+        run: |
+          set -euo pipefail
+          cd "${WORK_DIR}"
+          cargo build --workspace
+          # ...and whatever produces your app's build products, so the Swift
+          # compilation cache is populated too.
+
+      # The build directory is baked into the image and the strip is a fixed
+      # removal list that does not cover it, so anything secret-shaped left
+      # there reaches every future clone. Failing here refuses retention.
+      - name: Refuse to bake credentials into the image
+        run: |
+          set -euo pipefail
+          hit="$(find "${WORK_DIR}" -maxdepth 3 \( -name '.env' -o -name '*.p12' \
+            -o -name '*.p8' -o -name '*.mobileprovision' \) -print 2>/dev/null \
+            | head -n1 || true)"
+          [ -z "${hit}" ] || { echo "::error::${hit} would be baked into the image"; exit 1; }
+
+      - name: Report cache use
+        if: always()
+        run: sccache --show-stats || true
+
+      # Last step, and required. A guest runner can exit non-zero after
+      # completing its job, so reaching a terminal state is not evidence the
+      # build succeeded. Without this the daemon refuses to retain the guest.
+      # The strip verifies and removes it, so it never survives into the image.
+      - name: Mark the regeneration complete
+        run: touch "$HOME/.flanforge-regeneration-complete"
+
+      # Deliberately no cancellation job. Retention runs after this job's
+      # runner exits, so cancelling the allocation aborts it and no image is
+      # produced. The daemon releases the guest itself once it has promoted.
+

@@ -1,0 +1,13 @@
+[package]
+name = "flanforge-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+flanforge-core = { workspace = true }
+url = { workspace = true }
+
+[lints]
+workspace = true

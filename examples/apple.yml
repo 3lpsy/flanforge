@@ -1,0 +1,101 @@
+# Smoke test for the full FlanForge path: a Linux job allocates a macOS guest,
+# then a dependent job runs inside the disposable Tart VM.
+#
+# Copy to a consumer repository as `.forgejo/workflows/apple.yml`. The file name
+# must appear in the profile's `allowed_workflows`, and the second job's `name`
+# must equal the profile's `job_name`.
+name: apple
+
+on:
+  workflow_dispatch:
+
+# Forgejo's own key for OIDC identity tokens; it does not implement GitHub's
+# `permissions: id-token: write`. Without this there is no token endpoint.
+enable-openid-connect: true
+
+permissions:
+  contents: read
+
+jobs:
+  allocate-macos:
+    # An existing Linux runner. flanforged is never a runner itself.
+    runs-on: ci-podman-base
+    outputs:
+      runner_label: ${{ steps.allocate.outputs.runner_label }}
+      allocation_id: ${{ steps.allocate.outputs.allocation_id }}
+    steps:
+      - name: Request a macOS allocation
+        id: allocate
+        env:
+          # Tailnet address of the Mac running flanforged, e.g. https://mac:9843
+          FLANFORGED_URL: ${{ vars.FLANFORGED_URL }}
+          PROFILE: flanforge
+        run: |
+          set -euo pipefail
+          identity="$(curl -fsS \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=flanforged" \
+            | jq -r '.value')"
+          [ -n "${identity}" ] || { echo "no OIDC token issued" >&2; exit 1; }
+
+          body="$(jq -cn \
+            --arg profile "${PROFILE}" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --argjson run_id "${GITHUB_RUN_ID}" \
+            --argjson run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            '{profile: $profile, repository: $repository, run_id: $run_id, run_attempt: $run_attempt}')"
+
+          # Returns once the guest is booted and its runner is registered, so
+          # this call blocks for the profile's boot budget.
+          allocation="$(curl -fsS -X POST "${FLANFORGED_URL}/v1/allocations" \
+            -H "Authorization: Bearer ${identity}" \
+            -H 'Content-Type: application/json' \
+            -d "${body}")"
+
+          label="$(printf '%s' "${allocation}" | jq -r '.runner_label')"
+          id="$(printf '%s' "${allocation}" | jq -r '.id')"
+          state="$(printf '%s' "${allocation}" | jq -r '.state')"
+          [ -n "${label}" ] && [ "${label}" != null ] \
+            || { echo "no runner label returned" >&2; exit 1; }
+          echo "allocated ${id} in state ${state} with label ${label}"
+          {
+            echo "runner_label=${label}"
+            echo "allocation_id=${id}"
+          } >> "${GITHUB_OUTPUT}"
+
+  # `name` must match the profile's job_name: flanforged binds the guest runner
+  # to exactly one waiting job with this name and run attempt.
+  apple-build:
+    name: apple-build
+    needs: allocate-macos
+    runs-on: ${{ needs.allocate-macos.outputs.runner_label }}
+    steps:
+      - name: Identify the guest
+        run: |
+          set -euo pipefail
+          echo "user:    $(whoami)"
+          echo "host:    $(hostname)"
+          echo "macOS:   $(sw_vers -productVersion)"
+          echo "arch:    $(uname -m)"
+          echo "xcode:   $(xcodebuild -version | head -n 1)"
+
+  # The daemon also cleans up on timeout; this releases the slot immediately
+  # when the build job never becomes eligible.
+  release:
+    needs: [allocate-macos, apple-build]
+    if: always() && needs.allocate-macos.result == 'success'
+    runs-on: ci-podman-base
+    steps:
+      - name: Cancel the allocation
+        env:
+          FLANFORGED_URL: ${{ vars.FLANFORGED_URL }}
+          ALLOCATION_ID: ${{ needs.allocate-macos.outputs.allocation_id }}
+        run: |
+          set -euo pipefail
+          identity="$(curl -fsS \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=flanforged" \
+            | jq -r '.value')"
+          curl -fsS -X DELETE \
+            "${FLANFORGED_URL}/v1/allocations/${ALLOCATION_ID}" \
+            -H "Authorization: Bearer ${identity}" >/dev/null

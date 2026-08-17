@@ -1,0 +1,7 @@
+# cargo-nextest configuration for local and CI workspace test runs.
+# nextest does not execute doctests; the justfile's ci-tests recipe runs those
+# separately.
+
+[profile.default]
+# Warn when a test reaches 60 seconds and terminate it after 120 seconds.
+slow-timeout = { period = "60s", terminate-after = 2 }

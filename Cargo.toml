@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flanforge",
+    "crates/flanforge-auth",
+    "crates/flanforge-cli",
+    "crates/flanforge-config",
+    "crates/flanforge-core",
+    "crates/flanforge-forgejo",
+    "crates/flanforge-logging",
+    "crates/flanforge-manager",
+    "crates/flanforge-router",
+    "crates/flanforge-routes",
+    "crates/flanforge-runtime",
+    "crates/flanforge-store",
+    "crates/flanforge-test-support",
+    "crates/flanforge-utils",
+]
+
+[workspace.package]
+version = "0.2.1"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["http1", "json", "tokio"] }
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+http = "1"
+jsonwebtoken = "9"
+flanforge-core = { path = "crates/flanforge-core" }
+flanforge-auth = { path = "crates/flanforge-auth" }
+flanforge-cli = { path = "crates/flanforge-cli" }
+flanforge-config = { path = "crates/flanforge-config" }
+flanforge-forgejo = { path = "crates/flanforge-forgejo" }
+flanforge-logging = { path = "crates/flanforge-logging" }
+flanforge-manager = { path = "crates/flanforge-manager" }
+flanforge-router = { path = "crates/flanforge-router" }
+flanforge-routes = { path = "crates/flanforge-routes" }
+flanforge-runtime = { path = "crates/flanforge-runtime" }
+flanforge-store = { path = "crates/flanforge-store" }
+flanforge-test-support = { path = "crates/flanforge-test-support" }
+flanforge-utils = { path = "crates/flanforge-utils" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shell-words = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+validator = { version = "0.20", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

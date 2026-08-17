@@ -1,0 +1,22 @@
+[package]
+name = "flanforge-routes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+axum = { workspace = true }
+flanforge-auth = { workspace = true }
+flanforge-core = { workspace = true }
+flanforge-manager = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+validator = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
