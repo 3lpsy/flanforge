@@ -1,0 +1,170 @@
+name: release
+
+# Public release built on the GitHub mirror: the darwin and linux binaries as
+# release assets under v<workspace version>, and the container on ghcr.io.
+# Runs on every mirror push and exits early while the release already exists,
+# so a version bump upstream is what actually publishes.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: flanforge-release
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      exists: ${{ steps.meta.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the workspace version and look for its release
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -n1)"
+          [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::workspace version is not a plain X.Y.Z"; exit 1; }
+          exists=false
+          gh release view "v${version}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 && exists=true
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${version}" >> "${GITHUB_OUTPUT}"
+          echo "exists=${exists}" >> "${GITHUB_OUTPUT}"
+
+  darwin:
+    needs: meta
+    if: needs.meta.outputs.exists == 'false'
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build flanforged for Darwin/ARM64
+        run: |
+          set -euo pipefail
+          # Public build: no dependency proxy; crates come from crates.io.
+          rm -f .cargo/config.toml
+          # The macOS ARM64 images ship no Rust toolchain.
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          export PATH="${HOME}/.cargo/bin:${PATH}"
+          rustup target add wasm32-unknown-unknown
+          wbg="$(awk '/^name = "wasm-bindgen"$/{f=1} f && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' Cargo.lock)"
+          cargo install wasm-bindgen-cli --version "${wbg}" --locked
+          # Mirrors `just ui-build`; the daemon embeds webui/dist at compile time.
+          cargo build --locked -p flanforge-webui --profile wasm-release --target wasm32-unknown-unknown
+          wasm-bindgen --target web --no-typescript --out-dir webui/dist --out-name flanforge-webui \
+            target/wasm32-unknown-unknown/wasm-release/flanforge-webui.wasm
+          cp webui/app/index.html webui/app/assets/style.css webui/app/assets/favicon.svg webui/dist/
+          cargo build --locked --release --package flanforge
+          mkdir -p dist
+          install -m 0755 target/release/flanforged dist/flanforged-darwin-arm64
+          file dist/flanforged-darwin-arm64 | grep -Eq 'Mach-O.*arm64' \
+            || { echo "::error::not a Darwin ARM64 Mach-O binary"; exit 1; }
+          (cd dist && shasum -a 256 flanforged-darwin-arm64 > flanforged-darwin-arm64.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flanforged-darwin-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  linux:
+    needs: meta
+    if: needs.meta.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build flanforged for Linux/x86-64
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends libvirt-dev pkg-config
+          rm -f .cargo/config.toml
+          rustup target add wasm32-unknown-unknown
+          wbg="$(awk '/^name = "wasm-bindgen"$/{f=1} f && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' Cargo.lock)"
+          cargo install wasm-bindgen-cli --version "${wbg}" --locked
+          cargo build --locked -p flanforge-webui --profile wasm-release --target wasm32-unknown-unknown
+          wasm-bindgen --target web --no-typescript --out-dir webui/dist --out-name flanforge-webui \
+            target/wasm32-unknown-unknown/wasm-release/flanforge-webui.wasm
+          cp webui/app/index.html webui/app/assets/style.css webui/app/assets/favicon.svg webui/dist/
+          cargo build --locked --release --package flanforge
+          ldd target/release/flanforged | grep -Eq 'libvirt\.so\.' \
+            || { echo "::error::flanforged is not linked against libvirt"; exit 1; }
+          mkdir -p dist
+          install -m 0755 target/release/flanforged dist/flanforged-linux-x86_64
+          (cd dist && sha256sum flanforged-linux-x86_64 > flanforged-linux-x86_64.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flanforged-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  docker:
+    needs: [meta, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: flanforged-linux-x86_64
+          path: dist
+      - name: Build and push the service image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check flanforged-linux-x86_64.sha256)
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/flanforged"
+          context="$(mktemp -d)"
+          install -m 0755 dist/flanforged-linux-x86_64 "${context}/flanforged"
+          docker build -f ci/docker/public/Dockerfile \
+            -t "${image}:${VERSION}" -t "${image}:latest" "${context}"
+          echo "${GH_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          docker push "${image}:${VERSION}"
+          docker push "${image}:latest"
+
+  publish:
+    needs: [meta, darwin, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: flanforged-darwin-arm64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: flanforged-linux-x86_64
+          path: dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check flanforged-darwin-arm64.sha256)
+          (cd dist && sha256sum --check flanforged-linux-x86_64.sha256)
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "FlanForge ${TAG}" \
+            --notes "flanforged for macOS (Apple Silicon) and Linux (x86-64), with SHA-256 checksums. The container image is ghcr.io/${GITHUB_REPOSITORY_OWNER}/flanforged:${TAG#v}. See README.md for setup." \
+            dist/*

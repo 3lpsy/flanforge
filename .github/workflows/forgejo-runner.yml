@@ -1,0 +1,80 @@
+name: forgejo-runner
+
+# Forgejo does not publish a supported Darwin binary. This cross-builds the
+# repository-pinned source revision (ci/forgejo-runner.env) and publishes it
+# as forgejo-runner-v<upstream version>, which the Tart template build needs.
+# Runs on every mirror push and exits early while that release exists.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: flanforge-forgejo-runner
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the runner pin and look for its release
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pin_file=ci/forgejo-runner.env
+          version="$(sed -n 's/^FORGEJO_RUNNER_VERSION=//p' "${pin_file}")"
+          commit="$(sed -n 's/^FORGEJO_RUNNER_COMMIT=//p' "${pin_file}")"
+          [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::invalid Forgejo Runner version pin"; exit 1; }
+          [[ "${commit}" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::invalid Forgejo Runner commit pin"; exit 1; }
+          exists=false
+          gh release view "forgejo-runner-v${version}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 && exists=true
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+          echo "exists=${exists}" >> "${GITHUB_OUTPUT}"
+      - uses: actions/setup-go@v5
+        if: steps.meta.outputs.exists == 'false'
+        with:
+          go-version: stable
+      - name: Cross-compile Forgejo Runner for Apple Silicon
+        if: steps.meta.outputs.exists == 'false'
+        env:
+          RUNNER_VERSION: ${{ steps.meta.outputs.version }}
+          RUNNER_COMMIT: ${{ steps.meta.outputs.commit }}
+        run: |
+          set -euo pipefail
+          asset="forgejo-runner-${RUNNER_VERSION}-darwin-arm64"
+          source_dir="$(mktemp -d)"
+          git clone --quiet --depth 1 --branch "v${RUNNER_VERSION}" \
+            https://code.forgejo.org/forgejo/runner.git "${source_dir}/runner"
+          actual_commit="$(git -C "${source_dir}/runner" rev-parse HEAD)"
+          [ "${actual_commit}" = "${RUNNER_COMMIT}" ] \
+            || { echo "::error::runner tag resolved to unexpected commit ${actual_commit}"; exit 1; }
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 make -C "${source_dir}/runner" build
+          mkdir -p dist
+          install -m 0755 "${source_dir}/runner/forgejo-runner" "dist/${asset}"
+          file "dist/${asset}" | grep -Eq 'Mach-O.*arm64' \
+            || { echo "::error::not a Darwin ARM64 Mach-O binary"; exit 1; }
+          (cd dist && sha256sum "${asset}" > "${asset}.sha256" && sha256sum --check "${asset}.sha256")
+      - name: Publish the runner release
+        if: steps.meta.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNNER_VERSION: ${{ steps.meta.outputs.version }}
+          RUNNER_COMMIT: ${{ steps.meta.outputs.commit }}
+        run: |
+          set -euo pipefail
+          gh release create "forgejo-runner-v${RUNNER_VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "Forgejo Runner ${RUNNER_VERSION} for Darwin/ARM64" \
+            --notes "Unsupported Darwin/ARM64 cross-build of Forgejo Runner ${RUNNER_VERSION} from upstream commit \`${RUNNER_COMMIT}\`, for the FlanForge Tart template build." \
+            dist/*
