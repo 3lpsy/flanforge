@@ -1,0 +1,29 @@
+[package]
+name = "flanforge-webui-routes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+axum = { workspace = true }
+flanforge-extractors = { workspace = true }
+flanforge-handlers = { workspace = true }
+flanforge-webui-auth = { workspace = true }
+flanforge-wire = { workspace = true }
+flanforge-core = { workspace = true }
+flanforge-logging = { workspace = true }
+flanforge-store = { workspace = true }
+futures-util = { workspace = true }
+include_dir = { workspace = true }
+serde_json = { workspace = true }
+tokio-stream = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

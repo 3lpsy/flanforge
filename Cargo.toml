@@ -4,58 +4,153 @@ members = [
     "crates/flanforge",
     "crates/flanforge-auth",
     "crates/flanforge-cli",
+    "crates/flanforge-commands",
     "crates/flanforge-config",
     "crates/flanforge-core",
+    "crates/flanforge-extractors",
     "crates/flanforge-forgejo",
+    "crates/flanforge-handlers",
+    "crates/flanforge-libvirt-operator",
+    "crates/flanforge-libvirt-wire",
     "crates/flanforge-logging",
     "crates/flanforge-manager",
+    "crates/flanforge-migrations",
+    "crates/flanforge-orm",
+    "crates/flanforge-paths",
     "crates/flanforge-router",
     "crates/flanforge-routes",
     "crates/flanforge-runtime",
+    "crates/flanforge-runtime-libvirt",
+    "crates/flanforge-runtime-tart",
+    "crates/flanforge-service",
+    "crates/flanforge-service-files",
+    "crates/flanforge-service-launchctl",
+    "crates/flanforge-service-systemd",
     "crates/flanforge-store",
     "crates/flanforge-test-support",
     "crates/flanforge-utils",
+    "crates/flanforge-webui-auth",
+    "crates/flanforge-webui-routes",
+    "crates/flanforge-wire",
+    "webui/api-client",
+    "webui/app",
+    "webui/components",
+]
+
+# wasm32-only crates are excluded here so host-wide cargo commands skip them;
+# cargo has no glob-minus, so a new crates/* member must be added to this list.
+default-members = [
+    "crates/flanforge",
+    "crates/flanforge-auth",
+    "crates/flanforge-cli",
+    "crates/flanforge-commands",
+    "crates/flanforge-config",
+    "crates/flanforge-core",
+    "crates/flanforge-extractors",
+    "crates/flanforge-forgejo",
+    "crates/flanforge-handlers",
+    "crates/flanforge-libvirt-operator",
+    "crates/flanforge-libvirt-wire",
+    "crates/flanforge-logging",
+    "crates/flanforge-manager",
+    "crates/flanforge-migrations",
+    "crates/flanforge-orm",
+    "crates/flanforge-paths",
+    "crates/flanforge-router",
+    "crates/flanforge-routes",
+    "crates/flanforge-runtime",
+    "crates/flanforge-runtime-libvirt",
+    "crates/flanforge-runtime-tart",
+    "crates/flanforge-service",
+    "crates/flanforge-service-files",
+    "crates/flanforge-service-launchctl",
+    "crates/flanforge-service-systemd",
+    "crates/flanforge-store",
+    "crates/flanforge-test-support",
+    "crates/flanforge-utils",
+    "crates/flanforge-webui-auth",
+    "crates/flanforge-webui-routes",
+    "crates/flanforge-wire",
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.6.3"
 edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
+argon2 = { version = "0.5", features = ["std"] }
 async-trait = "0.1"
+base64 = "0.22"
 axum = { version = "0.8", features = ["http1", "json", "tokio"] }
 clap = { version = "4", features = ["derive"] }
+dioxus = { version = "0.7", features = ["web", "router", "document"] }
 fs2 = "0.4"
+futures-util = { version = "0.3", default-features = false }
+getrandom = "0.3"
 http = "1"
+include_dir = "0.7"
+js-sys = "0.3"
+# Direct dep only to switch on OsRng for salt generation (argon2 re-exports it).
+password-hash = { version = "0.5", features = ["getrandom"] }
 jsonwebtoken = "9"
+libc = "0.2"
 flanforge-core = { path = "crates/flanforge-core" }
 flanforge-auth = { path = "crates/flanforge-auth" }
 flanforge-cli = { path = "crates/flanforge-cli" }
+flanforge-commands = { path = "crates/flanforge-commands" }
 flanforge-config = { path = "crates/flanforge-config" }
+flanforge-extractors = { path = "crates/flanforge-extractors" }
 flanforge-forgejo = { path = "crates/flanforge-forgejo" }
+flanforge-handlers = { path = "crates/flanforge-handlers" }
+flanforge-libvirt-operator = { path = "crates/flanforge-libvirt-operator" }
+flanforge-libvirt-wire = { path = "crates/flanforge-libvirt-wire" }
 flanforge-logging = { path = "crates/flanforge-logging" }
 flanforge-manager = { path = "crates/flanforge-manager" }
+flanforge-migrations = { path = "crates/flanforge-migrations" }
+flanforge-orm = { path = "crates/flanforge-orm" }
+flanforge-paths = { path = "crates/flanforge-paths" }
 flanforge-router = { path = "crates/flanforge-router" }
 flanforge-routes = { path = "crates/flanforge-routes" }
 flanforge-runtime = { path = "crates/flanforge-runtime" }
+flanforge-runtime-libvirt = { path = "crates/flanforge-runtime-libvirt" }
+flanforge-runtime-tart = { path = "crates/flanforge-runtime-tart" }
+flanforge-service = { path = "crates/flanforge-service" }
+flanforge-service-files = { path = "crates/flanforge-service-files" }
+flanforge-service-launchctl = { path = "crates/flanforge-service-launchctl" }
+flanforge-service-systemd = { path = "crates/flanforge-service-systemd" }
 flanforge-store = { path = "crates/flanforge-store" }
 flanforge-test-support = { path = "crates/flanforge-test-support" }
 flanforge-utils = { path = "crates/flanforge-utils" }
+flanforge-webui-auth = { path = "crates/flanforge-webui-auth" }
+flanforge-webui-routes = { path = "crates/flanforge-webui-routes" }
+flanforge-wire = { path = "crates/flanforge-wire" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# default-features off: with-chrono would drag iana-time-zone and a CoreFoundation
+# framework link into the Darwin cross-build, which the zig linker cannot satisfy.
+sea-orm = { version = "2", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "sqlite-use-returning-for-3_35", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shell-words = "1"
+sha2 = "0.10"
 thiserror = "2"
+time = { version = "0.3", features = ["parsing"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.8"
+toml_edit = { version = "0.22", features = ["serde"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+# Pinned exactly: the wasm-bindgen CLI that post-processes the wasm must match
+# the library version compiled into it.
+wasm-bindgen = "=0.2.125"
+wasm-bindgen-futures = "0.4"
+web-sys = "0.3"
 validator = { version = "0.20", features = ["derive"] }
 
 [workspace.lints.rust]
@@ -73,3 +168,10 @@ panic = "deny"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# The UI bundle: small over fast, panics abort (no unwinding machinery).
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = true
+panic = "abort"

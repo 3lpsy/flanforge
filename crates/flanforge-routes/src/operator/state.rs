@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use flanforge_manager::AllocationManager;
+use flanforge_orm::{SessionService, UserService};
 
 /// The host-only surface. It carries no OIDC verifier, because a workflow
 /// identity means nothing here; what it does carry is the credential only a
@@ -10,6 +11,8 @@ pub struct OperatorState {
     pub(super) manager: AllocationManager,
     pub(super) listen: SocketAddr,
     pub(super) token: String,
+    pub(super) users: UserService,
+    pub(super) sessions: SessionService,
 }
 
 impl std::fmt::Debug for OperatorState {
@@ -23,11 +26,19 @@ impl std::fmt::Debug for OperatorState {
 
 impl OperatorState {
     #[must_use]
-    pub fn new(manager: AllocationManager, listen: SocketAddr, token: String) -> Self {
+    pub fn new(
+        manager: AllocationManager,
+        listen: SocketAddr,
+        token: String,
+        users: UserService,
+        sessions: SessionService,
+    ) -> Self {
         Self {
             manager,
             listen,
             token,
+            users,
+            sessions,
         }
     }
 }

@@ -16,6 +16,9 @@
 #   FLANFORGE_AUDIENCE   OIDC audience (default: flanforged)
 #   FLANFORGE_TIMEOUT    seconds to await the allocation (default: 900)
 #   FLANFORGE_WARM       1/true/yes to clone the project's warm image
+#   FLANFORGE_HOT        1/true/yes to keep the guest for the next hot request,
+#                        a whole number of seconds to keep it for that long, or
+#                        "evict" to tear this profile's kept machines down
 #   FLANFORGE_CPU_COUNT  guest CPUs, bounded by the profile
 #   FLANFORGE_MEMORY_MB  guest memory, bounded by the profile
 #
@@ -108,6 +111,15 @@ case "${command}" in
     # Opt in to the project's warm image; omitted means the trusted base, cold.
     case "${FLANFORGE_WARM:-}" in
       1|true|yes|TRUE|YES) body="${body},\"warm\":true" ;;
+    esac
+    # One field, four meanings. Omitted leaves the pool alone, which is what a
+    # workflow that knows nothing about hot must do to one that relies on it.
+    case "${FLANFORGE_HOT:-}" in
+      '') ;;
+      1|true|yes|TRUE|YES) body="${body},\"hot\":true" ;;
+      evict) body="${body},\"hot\":\"evict\"" ;;
+      *[!0-9]*) die "FLANFORGE_HOT must be true, a whole number of seconds, or evict" "${EXIT_USAGE}" ;;
+      *) body="${body},\"hot\":${FLANFORGE_HOT}" ;;
     esac
     for pair in "cpu_count:${FLANFORGE_CPU_COUNT:-}" "memory_mb:${FLANFORGE_MEMORY_MB:-}"; do
       value="${pair#*:}"

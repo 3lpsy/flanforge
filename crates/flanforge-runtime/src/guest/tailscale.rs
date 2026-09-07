@@ -1,20 +1,23 @@
-use std::{path::Path, process::Stdio};
+use std::path::Path;
 
-use tokio::io::AsyncWriteExt;
-
+use flanforge_core::RuntimeBackendKind;
 use flanforge_manager::WorkerError;
 
-use super::{GuestControl, ensure_ip, shell_quote};
+use super::{
+    GuestControl, GuestSession, paths::TAILSCALE_KEY_TEMPLATE as GUEST_KEY_TEMPLATE, shell_quote,
+};
+use crate::channel::{GuestCapture, GuestCommand, GuestProgram, GuestSecret};
 
-/// One path for both the join and the retention logout: a strip that looked
-/// somewhere else would silently bake the tailnet identity into the image.
-pub(super) const TAILSCALE_PATH: &str = "/opt/homebrew/bin/tailscale";
-const GUEST_KEY_PATH: &str = "/tmp/flanforged-tailscale-preauth-key";
+/// Each guest platform has one fixed path for its connection bootstrap.
+pub const TART_TAILSCALE_PATH: &str = "/opt/homebrew/bin/tailscale";
+pub const LIBVIRT_TAILSCALE_PATH: &str = "/usr/bin/tailscale";
 const MAX_KEY_BYTES: u64 = 1_024;
 
 impl GuestControl {
-    pub(crate) async fn ensure_tailscale_connected(&self, ip: &str) -> Result<(), WorkerError> {
-        ensure_ip(ip)?;
+    pub(crate) async fn ensure_tailscale_connected(
+        &self,
+        session: &GuestSession,
+    ) -> Result<(), WorkerError> {
         if !self.tailscale.enabled {
             tracing::trace!("guest Tailscale bootstrap is disabled");
             return Ok(());
@@ -35,45 +38,29 @@ impl GuestControl {
             .extra_arguments()
             .map_err(|_| WorkerError::new("Tailscale extra arguments are structurally invalid"))?;
         let script = tailscale_script(
+            self.tailscale_path,
             login_server.as_str(),
             self.tailscale.hostname.as_deref(),
             &extra_args,
-            &self.config.ssh_user,
+            &self.runner_user,
         );
-        let mut child = self
-            .ssh_command(ip)
-            .arg(script)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| WorkerError::new("cannot start guest Tailscale bootstrap"))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| WorkerError::new("cannot open guest Tailscale input"))?;
-        stdin
-            .write_all(key.as_bytes())
+        let secret = GuestSecret::line(&key)?;
+        let command = GuestCommand::new(
+            GuestProgram::Script(&script),
+            Some(&secret),
+            GuestCapture::Discard,
+        )?;
+        let exit = self
+            .channel
+            .run(session, &command)
             .await
-            .map_err(|_| WorkerError::new("cannot deliver guest Tailscale credential"))?;
-        stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|_| WorkerError::new("cannot deliver guest Tailscale credential"))?;
-        drop(stdin);
-        let status = child
-            .wait()
-            .await
-            .map_err(|_| WorkerError::new("cannot wait for guest Tailscale bootstrap"))?;
-        if status.success() {
+            .map_err(|_| WorkerError::new("cannot start guest Tailscale bootstrap"))?
+            .exit();
+        if exit.is_success() {
             tracing::info!("guest Tailscale connection is ready");
             Ok(())
         } else {
-            tracing::warn!(
-                exit_code = status.code(),
-                "guest Tailscale bootstrap failed"
-            );
+            tracing::warn!(exit_code = exit.code(), "guest Tailscale bootstrap failed");
             Err(WorkerError::new("guest Tailscale bootstrap failed"))
         }
     }
@@ -114,6 +101,7 @@ async fn read_preauth_key(path: &Path) -> Result<String, WorkerError> {
 }
 
 fn tailscale_script(
+    tailscale_path: &str,
     login_server: &str,
     hostname: Option<&str>,
     extra_args: &[String],
@@ -121,25 +109,31 @@ fn tailscale_script(
 ) -> String {
     // The operator is a per-profile preference, so the login that starts a new
     // profile must re-assert it or the guest account loses local API access.
-    let mut arguments = vec![
-        format!("--auth-key=file:{GUEST_KEY_PATH}"),
+    let mut arguments = extra_args.to_vec();
+    arguments.extend([
         format!("--login-server={login_server}"),
         format!("--operator={operator}"),
-    ];
+    ]);
     if let Some(hostname) = hostname {
         arguments.push(format!("--hostname={hostname}"));
     }
-    arguments.extend(extra_args.iter().cloned());
     let arguments = arguments
         .iter()
         .map(|argument| shell_quote(argument))
         .collect::<Vec<_>>()
         .join(" ");
-    let key_path = shell_quote(GUEST_KEY_PATH);
-    let tailscale = shell_quote(TAILSCALE_PATH);
+    let key_template = shell_quote(GUEST_KEY_TEMPLATE);
+    let tailscale = shell_quote(tailscale_path);
     format!(
-        "umask 077; key_path={key_path}; cleanup() {{ /bin/rm -f \"$key_path\"; }}; on_signal() {{ cleanup; trap - EXIT; exit 1; }}; trap cleanup EXIT; trap on_signal HUP INT TERM; IFS= read -r key || exit 1; printf %s \"$key\" > \"$key_path\"; unset key; {tailscale} logout >/dev/null 2>&1 && {tailscale} up {arguments} >/dev/null && {tailscale} status --json | /usr/bin/grep -Eq '\"BackendState\"[[:space:]]*:[[:space:]]*\"Running\"'"
+        "umask 077; key_path=$(/usr/bin/mktemp {key_template}) || exit 1; /bin/chmod 0600 \"$key_path\" || {{ /bin/rm -f \"$key_path\"; exit 1; }}; cleanup() {{ /bin/rm -f \"$key_path\"; }}; on_signal() {{ cleanup; trap - EXIT; exit 1; }}; trap cleanup EXIT; trap on_signal HUP INT TERM; IFS= read -r key || exit 1; /usr/bin/printf %s \"$key\" > \"$key_path\" || exit 1; unset key; {tailscale} logout >/dev/null 2>&1 && {tailscale} up {arguments} \"--auth-key=file:$key_path\" >/dev/null && {tailscale} status --json | /usr/bin/grep -Eq '\"BackendState\"[[:space:]]*:[[:space:]]*\"Running\"'"
     )
+}
+
+pub(super) const fn path(backend: RuntimeBackendKind) -> &'static str {
+    match backend {
+        RuntimeBackendKind::Tart => TART_TAILSCALE_PATH,
+        RuntimeBackendKind::Libvirt => LIBVIRT_TAILSCALE_PATH,
+    }
 }
 
 #[cfg(test)]

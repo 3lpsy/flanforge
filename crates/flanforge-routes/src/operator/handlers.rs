@@ -4,11 +4,19 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use flanforge_core::{Allocation, AllocationId};
-use flanforge_manager::{AllocationSummary, OperatorStatus, SweepReport};
+use flanforge_core::{Allocation, AllocationId, VmName};
+use flanforge_manager::{AllocationSummary, HotGuestStatus, OperatorStatus, SweepReport};
 use serde::Deserialize;
 
 use super::{super::error::ApiError, OperatorState};
+
+/// Whether a retirement waits for the current claim. Absent or `false` drains,
+/// which is the polite one.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HotRetireBody {
+    evict: bool,
+}
 
 /// Whether the sweep may delete. Absent or `false` plans only.
 #[derive(Debug, Default, Deserialize)]
@@ -35,6 +43,32 @@ pub async fn cancel(
     let id = AllocationId::from_str(&id).map_err(|_| ApiError::BadRequest)?;
     tracing::info!(allocation_id = %id, "operator allocation cancellation requested");
     Ok(Json(state.manager.cancel_by_id(id).await?))
+}
+
+/// Lists every hot guest record: lane, age, jobs served, and claim.
+pub async fn hot(State(state): State<OperatorState>) -> Json<Vec<HotGuestStatus>> {
+    Json(state.manager.hot_list().await)
+}
+
+/// Stops one machine taking new claims, or destroys it outright.
+///
+/// # Errors
+///
+/// Returns a typed rejection for a malformed or unclaimed VM name.
+pub async fn hot_retire(
+    State(state): State<OperatorState>,
+    Path(name): Path<String>,
+    body: Option<Json<HotRetireBody>>,
+) -> Result<Json<Vec<HotGuestStatus>>, ApiError> {
+    let name = VmName::new(name).map_err(|_| ApiError::BadRequest)?;
+    let is_evict = body.is_some_and(|Json(body)| body.evict);
+    tracing::info!(vm_name = %name, is_evict, "operator hot guest retirement requested");
+    if is_evict {
+        state.manager.hot_evict(&name).await?;
+    } else {
+        state.manager.hot_drain(&name).await?;
+    }
+    Ok(Json(state.manager.hot_list().await))
 }
 
 /// Reports capacity, configuration generation, warm images, and the last sweep.

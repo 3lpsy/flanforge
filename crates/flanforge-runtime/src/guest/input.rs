@@ -1,7 +1,5 @@
 use validator::{Validate, ValidationError};
 
-use flanforge_manager::WorkerError;
-
 #[derive(Debug, Validate)]
 pub(super) struct GuestRunnerInput {
     #[validate(custom(function = "validate_absolute_path"))]
@@ -12,15 +10,10 @@ pub(super) struct GuestRunnerInput {
     pub(super) uuid: String,
     #[validate(custom(function = "validate_label"))]
     pub(super) label: String,
-    #[validate(custom(function = "validate_uuid"))]
+    /// Forgejo publishes the job handle as opaque, so it is bounded by shape
+    /// rather than parsed as a UUID (CORE-321).
+    #[validate(custom(function = "validate_handle"))]
     pub(super) handle: String,
-}
-
-pub(super) fn ensure_ip(value: &str) -> Result<(), WorkerError> {
-    value
-        .parse::<std::net::IpAddr>()
-        .map(|_| ())
-        .map_err(|_| WorkerError::new("guest IP address is structurally invalid"))
 }
 
 pub(super) fn validate_absolute_path(value: &str) -> Result<(), ValidationError> {
@@ -91,15 +84,28 @@ fn validate_uuid(value: &str) -> Result<(), ValidationError> {
         .map_err(|_| ValidationError::new("uuid"))
 }
 
-fn validate_label(value: &str) -> Result<(), ValidationError> {
-    if !value.is_empty()
+/// The bounded opaque-token shape shared by the runner label and the job
+/// handle: both are interpolated into a single-quoted shell word.
+fn is_opaque_token(value: &str) -> bool {
+    !value.is_empty()
         && value.len() <= 128
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
-    {
+}
+
+fn validate_label(value: &str) -> Result<(), ValidationError> {
+    if is_opaque_token(value) {
         Ok(())
     } else {
         Err(ValidationError::new("runner_label"))
+    }
+}
+
+fn validate_handle(value: &str) -> Result<(), ValidationError> {
+    if is_opaque_token(value) {
+        Ok(())
+    } else {
+        Err(ValidationError::new("handle"))
     }
 }

@@ -2,6 +2,7 @@ use flanforge_core::{
     AllocationId, AllocationMode, AllocationState, CloneSource, GuestSize, ProfileName,
     RepositoryName, VmName, WarmImageState,
 };
+use flanforge_wire::{CapacityStatus, RuntimeStatus};
 use serde::{Deserialize, Serialize};
 
 use super::super::SweepReport;
@@ -23,20 +24,6 @@ pub struct AllocationSummary {
     pub source: Option<CloneSource>,
 }
 
-/// What admission would decide right now. Every field is derived on read.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct CapacityStatus {
-    pub active_allocations: usize,
-    pub foreign_running: usize,
-    pub max_running_vms: u8,
-    pub committed_cpu_count: u32,
-    pub committed_memory_mb: u32,
-    pub host_cpu_count: Option<u8>,
-    pub host_memory_mb: Option<u32>,
-    /// False when the host listing could not be taken, which is itself busy.
-    pub is_host_visible: bool,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WarmImageStatus {
     pub profile: ProfileName,
@@ -48,17 +35,25 @@ pub struct WarmImageStatus {
     pub is_referenced: bool,
     /// Proven unusable this run; cleared by a restart or the next promotion.
     pub is_quarantined: bool,
+    /// Superseded generations a backend still pins because a live or
+    /// recoverable consumer may be reading them. `None` where the backend
+    /// retains none at all, so parity with Tart's status output holds.
+    #[serde(default)]
+    pub retained_generations: Option<u32>,
 }
 
 /// In-memory fields read blank after a restart, so each is labelled rather
 /// than defaulted to something an operator would read as "never happened".
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OperatorStatus {
+    pub runtime: RuntimeStatus,
     pub capacity: CapacityStatus,
     /// Reload count since this process started, not since the file changed.
     pub config_generation: u64,
     pub restart_pending: Vec<String>,
     pub warm_images: Vec<WarmImageStatus>,
+    /// False when warm-image authority could not be read.
+    pub is_warm_image_store_visible: bool,
     /// None when no sweep has run *in this process*.
     pub last_sweep: Option<SweepReport>,
 }

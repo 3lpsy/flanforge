@@ -9,9 +9,10 @@ use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header,
     jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse},
 };
-use thiserror::Error;
 use tokio::sync::Mutex;
 use validator::Validate;
+
+use super::error::{AuthError, ProviderFailure, TokenRejection};
 
 const MINIMUM_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -60,7 +61,7 @@ impl OidcVerifier {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
-            .map_err(|_| AuthError::Unavailable)?;
+            .map_err(|_| AuthError::Unavailable(ProviderFailure::Client))?;
         Ok(Self {
             config,
             client,
@@ -80,9 +81,9 @@ impl OidcVerifier {
         }
         let mut last_attempt = self.last_refresh_attempt.lock().await;
         if last_attempt.is_some_and(|attempt| attempt.elapsed() < MINIMUM_REFRESH_INTERVAL) {
-            tracing::debug!("JWKS refresh suppressed by cooldown");
             // The cooldown bounds the fetch rate; it never extends a key set
-            // beyond its configured lifetime.
+            // beyond its configured lifetime. A refusal here reaches an
+            // operator as `reason="cooldown"` at the rejection log site.
             return self
                 .cache
                 .lock()
@@ -90,7 +91,7 @@ impl OidcVerifier {
                 .as_ref()
                 .filter(|cached| cached.is_fresh(self.key_lifetime()))
                 .map(|cached| cached.keys.clone())
-                .ok_or(AuthError::Unavailable);
+                .ok_or(AuthError::Unavailable(ProviderFailure::Cooldown));
         }
         *last_attempt = Some(Instant::now());
         drop(last_attempt);
@@ -136,19 +137,24 @@ impl OidcVerifier {
             .get(self.config.jwks_url.clone())
             .send()
             .await
-            .map_err(|_| AuthError::Unavailable)?
+            .map_err(|_| AuthError::Unavailable(ProviderFailure::Connect))?
             .error_for_status()
-            .map_err(|_| AuthError::Unavailable)?;
+            .map_err(|_| AuthError::Unavailable(ProviderFailure::Status))?;
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| AuthError::Unavailable)? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| AuthError::Unavailable(ProviderFailure::Connect))?
+        {
             if body.len().saturating_add(chunk.len()) > 262_144 {
-                return Err(AuthError::Unavailable);
+                return Err(AuthError::Unavailable(ProviderFailure::Oversize));
             }
             body.extend_from_slice(&chunk);
         }
-        let keys = serde_json::from_slice::<JwkSet>(&body).map_err(|_| AuthError::Unavailable)?;
+        let keys = serde_json::from_slice::<JwkSet>(&body)
+            .map_err(|_| AuthError::Unavailable(ProviderFailure::Malformed))?;
         if keys.keys.is_empty() {
-            return Err(AuthError::Unavailable);
+            return Err(AuthError::Unavailable(ProviderFailure::EmptyKeySet));
         }
         Ok(keys)
     }
@@ -162,7 +168,7 @@ impl OidcVerifier {
                 .filter(|jwk| jwk.common.key_id.as_deref() == Some(key_id));
             if let Some(jwk) = matching.next() {
                 if matching.next().is_some() {
-                    return Err(AuthError::InvalidToken);
+                    return Err(AuthError::InvalidToken(TokenRejection::AmbiguousKey));
                 }
                 let is_rsa = matches!(jwk.algorithm, AlgorithmParameters::RSA(_));
                 let is_rs256 = jwk.common.key_algorithm == Some(KeyAlgorithm::RS256);
@@ -177,30 +183,35 @@ impl OidcVerifier {
                     .as_ref()
                     .is_none_or(|operations| operations.contains(&KeyOperations::Verify));
                 if !is_rsa || !is_rs256 || !is_signature || !can_verify {
-                    return Err(AuthError::InvalidToken);
+                    return Err(AuthError::InvalidToken(TokenRejection::KeyUnusable));
                 }
-                return DecodingKey::from_jwk(jwk).map_err(|_| AuthError::InvalidToken);
+                return DecodingKey::from_jwk(jwk)
+                    .map_err(|_| AuthError::InvalidToken(TokenRejection::KeyUnusable));
             }
         }
-        Err(AuthError::InvalidToken)
+        Err(AuthError::InvalidToken(TokenRejection::UnknownKey))
     }
 }
 
 #[async_trait]
 impl TokenVerifier for OidcVerifier {
     async fn verify(&self, token: &str) -> Result<ForgejoClaims, AuthError> {
-        if token.len() > 16_384 || token.bytes().any(|byte| byte.is_ascii_whitespace()) {
-            return Err(AuthError::InvalidToken);
+        if token.len() > 16_384 {
+            return Err(AuthError::InvalidToken(TokenRejection::Oversize));
         }
-        let header = decode_header(token).map_err(|_| AuthError::InvalidToken)?;
+        if token.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            return Err(AuthError::InvalidToken(TokenRejection::CompactShape));
+        }
+        let header =
+            decode_header(token).map_err(|_| AuthError::InvalidToken(TokenRejection::Header))?;
         if header.alg != Algorithm::RS256 {
-            return Err(AuthError::InvalidToken);
+            return Err(AuthError::InvalidToken(TokenRejection::Algorithm));
         }
         let key_id = header
             .kid
             .as_deref()
             .filter(|value| !value.is_empty())
-            .ok_or(AuthError::InvalidToken)?;
+            .ok_or(AuthError::InvalidToken(TokenRejection::KeyId))?;
         let key = self.decoding_key(key_id).await?;
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_audience(&[&self.config.audience]);
@@ -208,20 +219,26 @@ impl TokenVerifier for OidcVerifier {
         validation.set_required_spec_claims(&["exp", "iat", "iss", "aud", "nbf", "sub"]);
         validation.validate_nbf = true;
         validation.leeway = self.config.clock_skew_seconds;
+        // Normalisation precedes validation: a scheduled run carries a short
+        // ref that `validate` would otherwise reject before policy is reached.
         let claims = decode::<ForgejoClaims>(token, &key, &validation)
-            .map_err(|_| AuthError::InvalidToken)?
-            .claims;
-        claims.validate().map_err(|_| AuthError::InvalidToken)?;
+            .map_err(|error| AuthError::InvalidToken(TokenRejection::from_jwt(error.kind())))?
+            .claims
+            .normalized();
+        claims.validate().map_err(|errors| {
+            let (field, code) = flanforge_core::first_field_error(&errors);
+            AuthError::InvalidToken(TokenRejection::ClaimShape { field, code })
+        })?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| AuthError::InvalidToken)?
+            .map_err(|_| AuthError::InvalidToken(TokenRejection::Clock))?
             .as_secs();
         let skew = self.config.clock_skew_seconds;
-        if claims.iat > now.saturating_add(skew)
-            || claims.exp <= claims.iat
-            || claims.exp.saturating_sub(claims.iat) > 7_200
-        {
-            return Err(AuthError::InvalidToken);
+        if claims.iat > now.saturating_add(skew) {
+            return Err(AuthError::InvalidToken(TokenRejection::IssuedInFuture));
+        }
+        if claims.exp <= claims.iat || claims.exp.saturating_sub(claims.iat) > 7_200 {
+            return Err(AuthError::InvalidToken(TokenRejection::LifetimeCap));
         }
         tracing::debug!(
             repository = %claims.repository,
@@ -232,14 +249,4 @@ impl TokenVerifier for OidcVerifier {
         );
         Ok(claims)
     }
-}
-
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub enum AuthError {
-    #[error("authentication credentials are required")]
-    MissingCredentials,
-    #[error("authentication token is invalid")]
-    InvalidToken,
-    #[error("identity provider is unavailable")]
-    Unavailable,
 }

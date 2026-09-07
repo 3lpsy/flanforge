@@ -1,5 +1,9 @@
 /target/
 config.toml
+config.mac.toml
+config.apple.toml
+config.linux.toml
+config.libvirt.toml
 
 # Release assets fetched by `just fj-download*`.
 /flanforged
@@ -12,6 +16,10 @@ config.toml
 .env
 __pycache__
 
+/templates/libvirt/.env
+/templates/libvirt/output/
+/templates/tart/.env
+
 /data/dev/run/
 /data/tests/run/
 /data/tmp
@@ -19,3 +27,11 @@ __pycache__
 *.db-wal
 *.db-shm
 
+# Agent worktrees: a full checkout each, never part of the tree.
+.claude/worktrees/
+
+# Built web UI bundle; produced by 'just ui-build', embedded at daemon build time.
+# The directory itself is committed (.gitkeep): include_dir! needs it to exist
+# even when cargo skips the build script that would create it.
+/webui/dist/*
+!/webui/dist/.gitkeep

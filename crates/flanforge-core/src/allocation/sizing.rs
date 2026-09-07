@@ -1,9 +1,13 @@
-use crate::{Profile, allocation::AllocationMode, allocation::GuestSize};
+use crate::{HotRequest, Profile, allocation::AllocationMode, allocation::GuestSize};
 
 /// The request fields that select beneath profile policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RequestOptions {
     pub warm: bool,
+    /// What this run asks the pool to do. A preference the profile may refuse,
+    /// exactly as `warm` is, and deliberately not folded into
+    /// `AllocationMode`: it is orthogonal to which image the guest boots from.
+    pub hot: HotRequest,
     pub cpu_count: Option<u8>,
     pub memory_mb: Option<u32>,
 }
@@ -31,6 +35,7 @@ pub fn resolve_size(
     Ok(GuestSize {
         cpu_count,
         memory_mb,
+        storage_mb: profile.storage_mb,
     })
 }
 
@@ -49,7 +54,10 @@ pub fn resolve_mode(
             .is_some_and(|declared| declared == workflow_file);
     if is_producer {
         AllocationMode::Regenerate
-    } else if options.warm {
+    } else if options.warm || options.hot.is_retaining() {
+        // A retaining request sources like a warm one: "give it warm, and keep
+        // it". A profile that declares no warm template falls back to the cold
+        // template here exactly as a warm request does.
         AllocationMode::Warm
     } else {
         AllocationMode::Cold

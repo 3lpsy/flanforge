@@ -1,0 +1,17 @@
+# wasm32 only (hence not in default-members). Shared widgets and pure
+# formatting helpers for the flanforge web UI.
+[package]
+name = "flanforge-webui-components"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dioxus = { workspace = true }
+flanforge-webui-api-client = { path = "../api-client" }
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+
+[lints]
+workspace = true

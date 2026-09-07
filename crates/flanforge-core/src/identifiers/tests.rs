@@ -46,3 +46,15 @@ fn vm_prefix_must_end_in_hyphen() {
     assert!(invalid.is_ok());
     assert!(invalid.is_ok_and(|prefix| prefix.ensure_valid().is_err()));
 }
+
+#[test]
+fn profile_names_are_addressable_by_toml_and_cli_overlays() {
+    // Hyphenated names are deliberately admitted even though the environment
+    // overlay cannot spell them; TOML and --set still address them.
+    for valid in ["ci", "ci_2", "2_ci", "ci-linux"] {
+        assert!(ProfileName::new(valid).is_ok(), "rejected {valid}");
+    }
+    for invalid in ["CI", "ci.linux", "_ci", "-ci"] {
+        assert!(ProfileName::new(invalid).is_err(), "accepted {invalid}");
+    }
+}

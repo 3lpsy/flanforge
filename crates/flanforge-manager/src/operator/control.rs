@@ -65,7 +65,7 @@ impl AllocationManager {
         let profile = profile(&config, &allocation.request)
             .unwrap_or_else(|_| cleanup_only_profile(&allocation));
         let terminalized = self
-            .ensure_terminal(id, profile, AllocationState::Cancelled)
+            .ensure_terminal(allocation, profile, AllocationState::Cancelled)
             .await;
         if let Some(entry) = self.inner.entries.lock().await.get_mut(&id) {
             entry.is_terminalizing = false;

@@ -17,6 +17,8 @@ pub enum StoreError {
     InvalidAllocation { path: PathBuf },
     #[error("warm image record in {path} is structurally invalid")]
     InvalidWarmImage { path: PathBuf },
+    #[error("hot guest record in {path} is structurally invalid")]
+    InvalidHotGuest { path: PathBuf },
     #[error("cannot acquire state lock {path}: {source}")]
     Lock {
         path: PathBuf,
@@ -24,4 +26,6 @@ pub enum StoreError {
     },
     #[error("state directory sync task failed")]
     Sync,
+    #[error("database operation failed: {message}")]
+    Db { message: String },
 }

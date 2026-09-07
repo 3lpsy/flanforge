@@ -1,0 +1,34 @@
+[package]
+name = "flanforge-handlers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+flanforge-config = { workspace = true }
+flanforge-core = { workspace = true }
+flanforge-manager = { workspace = true }
+flanforge-orm = { workspace = true }
+flanforge-store = { workspace = true }
+flanforge-webui-auth = { workspace = true }
+flanforge-wire = { workspace = true }
+sea-orm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio-util = { workspace = true }
+flanforge-migrations = { workspace = true }
+flanforge-store = { workspace = true }
+flanforge-test-support = { workspace = true }
+tempfile = "3"
+uuid = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

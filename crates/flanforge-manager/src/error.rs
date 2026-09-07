@@ -1,4 +1,4 @@
-use flanforge_core::{AllocationId, AuthorizationError, StateTransitionError};
+use flanforge_core::{AllocationId, AuthorizationError, HotTransitionError, StateTransitionError};
 use thiserror::Error;
 
 use flanforge_store::StoreError;
@@ -31,6 +31,8 @@ pub enum ManagerError {
     DuplicateAllocation(AllocationId),
     #[error("invalid generated VM name: {0}")]
     InvalidVmName(String),
+    #[error("no hot guest record names {0}")]
+    UnknownHotGuest(String),
     #[error("invalid generated runner label: {0}")]
     InvalidRunnerLabel(String),
     #[error("request exceeds its profile ceiling")]
@@ -45,6 +47,8 @@ pub enum ManagerError {
     Authorization(#[from] AuthorizationError),
     #[error(transparent)]
     Transition(#[from] StateTransitionError),
+    #[error(transparent)]
+    HotTransition(#[from] HotTransitionError),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]

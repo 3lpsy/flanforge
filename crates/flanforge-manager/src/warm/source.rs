@@ -1,9 +1,25 @@
 use flanforge_core::{
     AllocationId, AllocationMode, AllocationState, BaseFingerprint, CloneKind, CloneSource,
-    FallbackReason, Profile, ProfileName, WarmImageState, is_fingerprint_match,
+    FallbackReason, Profile, ProfileName, VmName, WarmImageState, is_fingerprint_match,
 };
 
-use super::super::{AllocationManager, MachineState};
+use flanforge_wire::RuntimeCapability;
+
+use super::super::{AllocationManager, HostMachine, WarmAvailability};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceSelection {
+    pub source: CloneSource,
+    pub warm_generation: Option<u64>,
+}
+
+impl std::ops::Deref for SourceSelection {
+    type Target = CloneSource;
+
+    fn deref(&self) -> &Self::Target {
+        &self.source
+    }
+}
 
 impl AllocationManager {
     /// Resolves the clone source, failing toward the cold template and
@@ -13,16 +29,22 @@ impl AllocationManager {
         name: &ProfileName,
         profile: &Profile,
         mode: AllocationMode,
-    ) -> CloneSource {
+    ) -> SourceSelection {
         let fingerprint = self.inner.worker.base_fingerprint(&profile.template).await;
         if mode != AllocationMode::Warm {
-            return template_source(profile, fingerprint, None);
+            return SourceSelection {
+                source: template_source(profile, fingerprint, None),
+                warm_generation: None,
+            };
         }
         match self.warm_source(name, profile, fingerprint.clone()).await {
             Ok(source) => source,
             Err(reason) => {
                 tracing::warn!(profile = %name, ?reason, "warm image is unusable; booting the cold template");
-                template_source(profile, fingerprint, Some(reason))
+                SourceSelection {
+                    source: template_source(profile, fingerprint, Some(reason)),
+                    warm_generation: None,
+                }
             }
         }
     }
@@ -68,35 +90,42 @@ impl AllocationManager {
         name: &ProfileName,
         profile: &Profile,
         fingerprint: Option<BaseFingerprint>,
-    ) -> Result<CloneSource, FallbackReason> {
+    ) -> Result<SourceSelection, FallbackReason> {
         let warm = profile
             .warm_template
             .as_ref()
             .ok_or(FallbackReason::NotDeclared)?;
+        // Without this the config refusal is the only warm gate, and lifting
+        // it would leave production ungated on a backend that cannot produce.
+        if !self
+            .inner
+            .worker
+            .capabilities()
+            .is_supported(RuntimeCapability::WarmImages)
+        {
+            return Err(FallbackReason::Unsupported);
+        }
         if self.is_warm_quarantined(name).await {
             return Err(FallbackReason::Quarantined);
         }
-        let machine = self
-            .host_machines()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .find(|machine| machine.name == warm.as_str())
-            .cloned();
-        let record = self
-            .inner
-            .images
-            .load(name)
-            .await
-            .ok()
-            .flatten()
-            // An image nobody claims has unknown provenance: never used, and
-            // never overwritten.
-            .ok_or(if machine.is_some() {
-                FallbackReason::Unclaimed
-            } else {
-                FallbackReason::NoRecord
-            })?;
+        // One listing for the whole selection, from the same poll-interval
+        // cache admission takes: a name-addressed backend answers both
+        // questions below from it, and a pointer-addressed one ignores it.
+        let listing = match self.host_machines().await {
+            Ok(listing) => listing,
+            Err(error) => {
+                tracing::error!(profile = %name, %error, "host listing is unavailable");
+                return Err(FallbackReason::Absent);
+            }
+        };
+        let record = match self.inner.images.load(name).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return Err(self.missing_record(name, warm, &listing).await),
+            Err(error) => {
+                tracing::error!(profile = %name, %error, "warm image authority is unavailable");
+                return Err(self.missing_record(name, warm, &listing).await);
+            }
+        };
         if &record.warm_template != warm {
             return Err(FallbackReason::Repointed);
         }
@@ -105,20 +134,52 @@ impl AllocationManager {
         if record.state != WarmImageState::Promoted {
             return Err(FallbackReason::NotPromoted);
         }
-        let machine = machine.ok_or(FallbackReason::Absent)?;
-        if machine.state != MachineState::Stopped {
-            return Err(FallbackReason::NotStopped);
+        match self
+            .inner
+            .worker
+            .warm_availability(profile, &record, &listing)
+            .await
+        {
+            Ok(WarmAvailability::Ready) => {}
+            Ok(WarmAvailability::Busy) => return Err(FallbackReason::NotStopped),
+            Ok(WarmAvailability::Absent) => return Err(FallbackReason::Absent),
+            Err(error) => {
+                tracing::error!(profile = %name, %error, "warm image inventory is unavailable");
+                return Err(FallbackReason::Absent);
+            }
         }
         let fingerprint = fingerprint.ok_or(FallbackReason::FingerprintUnavailable)?;
         if !is_fingerprint_match(Some(&record.base_fingerprint), Some(&fingerprint)) {
             return Err(FallbackReason::StaleBase);
         }
-        Ok(CloneSource {
-            name: warm.clone(),
-            kind: CloneKind::Warm,
-            base_fingerprint: Some(fingerprint),
-            fallback_reason: None,
+        Ok(SourceSelection {
+            source: CloneSource {
+                name: warm.clone(),
+                kind: CloneKind::Warm,
+                base_fingerprint: Some(record.base_fingerprint.clone()),
+                fallback_reason: None,
+            },
+            warm_generation: Some(record.generation),
         })
+    }
+
+    /// Distinguishes "an image sits under this name that we never recorded"
+    /// from "nothing is there at all". Only a name-addressed backend can tell
+    /// them apart; a pointer-addressed one answers no and reports `NoRecord`.
+    async fn missing_record(
+        &self,
+        name: &ProfileName,
+        warm: &VmName,
+        listing: &[HostMachine],
+    ) -> FallbackReason {
+        match self.inner.worker.is_unclaimed_image(warm, listing).await {
+            Ok(true) => FallbackReason::Unclaimed,
+            Ok(false) => FallbackReason::NoRecord,
+            Err(error) => {
+                tracing::error!(profile = %name, %error, "warm image inventory is unavailable");
+                FallbackReason::Absent
+            }
+        }
     }
 }
 

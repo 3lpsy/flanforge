@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# Report whether this guest finished first-boot provisioning, as one JSON line.
+# Exit codes: 0 ready, 10 retry, 11 terminal, 64 usage.
+set -Eeuo pipefail
+
+schema=1
+contract=2
+account_name=""
+account_uid=0
+# Every path below is absolute under this prefix, which is empty in a guest.
+# Only the template's own test sets it, and the daemon's helper allow-list
+# admits no argument but --wait-seconds, so no caller can reach it.
+fixture_root=""
+
+usage() {
+  echo "usage: flanforge-guest-ready --wait-seconds <1-120> | --self-test" >&2
+  exit 64
+}
+
+wait_seconds=""
+self_test=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --wait-seconds)
+      [ "$#" -ge 2 ] || usage
+      wait_seconds="$2"
+      shift 2
+      ;;
+    --self-test)
+      self_test=true
+      shift
+      ;;
+    --fixture-root)
+      [ "$#" -ge 2 ] || usage
+      fixture_root="$2"
+      shift 2
+      ;;
+    *) usage ;;
+  esac
+done
+if [ "${self_test}" = false ]; then
+  [[ "${wait_seconds}" =~ ^[0-9]{1,3}$ ]] || usage
+  [ "${wait_seconds}" -ge 1 ] && [ "${wait_seconds}" -le 120 ] || usage
+fi
+if [ -n "${fixture_root}" ]; then
+  [[ "${fixture_root}" = /* && "${fixture_root}" != *..* ]] || usage
+fi
+
+jq_bin="${fixture_root}/usr/bin/jq"
+id_bin="${fixture_root}/usr/bin/id"
+cloud_init_bin="${fixture_root}/usr/bin/cloud-init"
+systemctl_bin="${fixture_root}/usr/bin/systemctl"
+runuser_bin="${fixture_root}/usr/sbin/runuser"
+timeout_bin="${fixture_root}/usr/bin/timeout"
+job_account_file="${fixture_root}/usr/local/share/flanforge/job-account"
+runner_bin="${fixture_root}/usr/local/bin/forgejo-runner"
+runtime_root="${fixture_root}/run/user"
+
+# One line, bounded, and built field by field so no guest byte can forge JSON.
+emit() {
+  local gate="$1" state="$2" detail="$3" code="$4" ready="$5"
+  shift 5
+  detail="$(printf '%s' "${detail}" | tr -c '\40-\176' ' ' | cut -c1-256)"
+  "${jq_bin}" -cn \
+    --argjson schema "${schema}" \
+    --argjson contract "${contract}" \
+    --argjson ready "${ready}" \
+    --arg gate "${gate}" \
+    --arg state "${state}" \
+    --arg detail "${detail}" \
+    --arg account "${account_name}" \
+    --argjson uid "${account_uid}" \
+    --args '{
+      schema: $schema, contract: $contract, ready: $ready, gate: $gate,
+      state: $state, detail: $detail,
+      failed_units: ($ARGS.positional[0:8]),
+      job_account: {name: $account, uid: $uid}
+    }' "$@"
+  exit "${code}"
+}
+
+for tool in "${jq_bin}" "${id_bin}" "${cloud_init_bin}" "${systemctl_bin}" \
+  "${runuser_bin}" "${timeout_bin}"; do
+  if [ ! -x "${tool}" ]; then
+    # jq itself may be the missing tool, so this one report is hand-built from
+    # a path reduced to characters that cannot escape a JSON string.
+    tool_text="$(printf '%s' "${tool}" | tr -cd 'A-Za-z0-9/._-' | cut -c1-200)"
+    echo "missing guest tool ${tool}" >&2
+    printf '{"schema":%s,"contract":%s,"ready":false,"gate":"self-test","state":"absent","detail":"missing guest tool %s","failed_units":[],"job_account":{"name":"","uid":0}}\n' \
+      "${schema}" "${contract}" "${tool_text}"
+    exit 11
+  fi
+done
+
+# The account is baked, never configured: it is what lets the daemon drop the
+# guest's SSH settings entirely.
+[ -f "${job_account_file}" ] && [ ! -L "${job_account_file}" ] \
+  || emit account absent "job account record is missing" 11 false
+IFS=: read -r account_name account_uid < "${job_account_file}" || true
+if ! [[ "${account_name}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] \
+  || ! [[ "${account_uid}" =~ ^[0-9]{1,7}$ ]] \
+  || [ "${account_uid}" -lt 1000 ]; then
+  account_name=""
+  account_uid=0
+  emit account invalid "job account record is malformed" 11 false
+fi
+
+if [ "${self_test}" = true ]; then
+  emit self-test ok "" 0 false
+fi
+
+status_json="$("${timeout_bin}" "${wait_seconds}" \
+  "${cloud_init_bin}" status --wait --format=json 2>/dev/null || true)"
+if [ -z "${status_json}" ]; then
+  # A --wait that timed out still has a terminal state to report; asking again
+  # without waiting turns a boot-timeout into a named cause.
+  status_json="$("${timeout_bin}" 10 \
+    "${cloud_init_bin}" status --format=json 2>/dev/null || true)"
+fi
+[ -n "${status_json}" ] \
+  || emit cloud-init unavailable "cloud-init did not report a status" 10 false
+cloud_init_state="$(printf '%s' "${status_json}" \
+  | "${jq_bin}" -r '.status // "unknown"' 2>/dev/null || true)"
+case "${cloud_init_state}" in
+  done) ;;
+  running|"not run")
+    emit cloud-init "${cloud_init_state}" "cloud-init has not finished" 10 false
+    ;;
+  error)
+    detail="$(printf '%s' "${status_json}" | "${jq_bin}" -r '
+      ((.errors // []) + ((.recoverable_errors // {}) | to_entries
+        | map("\(.key): \(.value | join("; "))")))
+      | map(select(. != null and . != "")) | .[0] // "cloud-init reported an error"
+    ' 2>/dev/null || true)"
+    emit cloud-init error "${detail:-cloud-init reported an error}" 11 false
+    ;;
+  *)
+    emit cloud-init "${cloud_init_state}" \
+      "cloud-init is in an unusable state" 11 false
+    ;;
+esac
+
+# The silent-failure catcher: a detached seed or a wrong FAT label yields
+# DataSourceNone together with status "done".
+datasource="$(printf '%s' "${status_json}" \
+  | "${jq_bin}" -r '.datasource // ""' 2>/dev/null || true)"
+# cloud-init >= 23 reports the lowercased short name ("nocloud"); the class
+# name is the pre-normalization spelling older releases emit.
+case "${datasource}" in
+  nocloud*|DataSourceNoCloud*) ;;
+  *)
+    emit cloud-init datasource \
+      "cloud-init used ${datasource:-no datasource} instead of NoCloud" 11 false
+    ;;
+esac
+
+system_state="$("${systemctl_bin}" is-system-running 2>/dev/null || true)"
+case "${system_state}" in
+  # Degraded is not fatal on its own: one unrelated distribution unit must not
+  # block every allocation. The required units are checked by name below.
+  running|degraded) ;;
+  initializing|starting)
+    emit units "${system_state}" "systemd is still starting" 10 false
+    ;;
+  *)
+    emit units "${system_state:-unknown}" "systemd is not running" 11 false
+    ;;
+esac
+
+failed_units=()
+for unit in qemu-guest-agent.service tailscaled.service \
+  flanforge-tailscale-operator.service; do
+  "${systemctl_bin}" is-active --quiet "${unit}" || failed_units+=("${unit}")
+done
+if [ "${#failed_units[@]}" -ne 0 ]; then
+  emit units inactive "required guest units are not active" 11 false \
+    "${failed_units[@]}"
+fi
+
+"${systemctl_bin}" is-active --quiet "user@${account_uid}.service" \
+  || emit session waiting "the job account's user session is not active" 10 false
+[ -S "${runtime_root}/${account_uid}/podman/podman.sock" ] \
+  || emit session waiting "the rootless container socket is absent" 10 false
+
+[ -x "${runner_bin}" ] \
+  || emit runner missing "the image-installed runner is not executable" 11 false
+# The same helper serves both channels: over SSH it already runs as the job
+# account, over the agent channel it runs as root and drops to it.
+if [ "$("${id_bin}" -u)" -eq "${account_uid}" ]; then
+  "${runner_bin}" one-job --help >/dev/null 2>&1 \
+    || emit runner incompatible "the image-installed runner rejected one-job" 11 false
+else
+  "${runuser_bin}" -u "${account_name}" -- "${runner_bin}" one-job --help \
+    >/dev/null 2>&1 \
+    || emit runner incompatible "the image-installed runner rejected one-job" 11 false
+fi
+
+emit ready ok "" 0 true

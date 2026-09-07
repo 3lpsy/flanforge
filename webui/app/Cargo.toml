@@ -1,0 +1,25 @@
+# wasm32 only (hence not in default-members). Plain cargo + wasm-bindgen-cli,
+# no `dx`: a pure SPA without asset! macros gains nothing from it.
+[package]
+name = "flanforge-webui"
+description = "Dioxus single-page web UI for flanforge, embedded by flanforged"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "flanforge-webui"
+path = "src/main.rs"
+
+[dependencies]
+dioxus = { workspace = true }
+flanforge-webui-api-client = { path = "../api-client" }
+flanforge-webui-components = { path = "../components" }
+flanforge-wire = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+wasm-bindgen = { workspace = true }
+
+[lints]
+workspace = true

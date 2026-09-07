@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError};
 
@@ -18,6 +20,7 @@ pub enum RetentionResult {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetentionPhase {
+    /// Kept only to decode durable records from the retired cleanup contract.
     Strip,
     Stop,
     Stage,
@@ -34,6 +37,9 @@ pub struct RetentionOutcome {
     #[validate(custom(function = "validate_reason"))]
     pub reason: String,
     pub generation: Option<u64>,
+    /// Host-side retention elapsed time, absent on older allocation records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 impl RetentionOutcome {
@@ -51,7 +57,14 @@ impl RetentionOutcome {
             phase,
             reason: bounded_text(reason, MAX_REASON_LEN),
             generation,
+            duration_ms: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_duration(mut self, duration: Duration) -> Self {
+        self.duration_ms = Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+        self
     }
 }
 

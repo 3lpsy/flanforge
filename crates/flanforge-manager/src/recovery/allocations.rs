@@ -4,11 +4,7 @@ use flanforge_core::{Allocation, AllocationState, Config, NetworkMode, Profile};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use super::super::{
-    AllocationManager, ManagerError,
-    resolve::profile,
-    service::{Entry, IN_MEMORY_ALLOCATION_LIMIT},
-};
+use super::super::{AllocationManager, ManagerError, resolve::profile, service::Entry};
 
 /// Cleanup budget applied when the record's configured profile is gone.
 const FALLBACK_CLEANUP_TIMEOUT_SECONDS: u64 = 300;
@@ -25,7 +21,7 @@ impl AllocationManager {
         let allocations = self
             .inner
             .store
-            .load_recent(IN_MEMORY_ALLOCATION_LIMIT)
+            .load_recent(self.inner.tuning.history_limit)
             .await?;
         let interrupted = allocations
             .iter()
@@ -55,7 +51,26 @@ impl AllocationManager {
                 "interrupted allocations remain and need operator attention"
             );
         }
-        self.ensure_warm_consistent(&config).await
+        // The backend reconciles its own durable state first: a crash
+        // mid-promotion leaves checkpoints only it can read.
+        if let Err(error) = self.inner.worker.ensure_recovered().await {
+            tracing::error!(%error, "backend crash reconciliation did not complete");
+        }
+        // After the backend reconciled its own durable state, so the listing
+        // hot records are checked against is as good as it gets.
+        if let Err(error) = self.ensure_hot_consistent().await {
+            tracing::error!(%error, "hot guest reconciliation did not complete");
+        }
+        self.ensure_warm_consistent(&config).await?;
+        self.emit(
+            flanforge_store::Event::new(flanforge_store::EventKind::RecoveryCompleted)
+                .with_payload(&serde_json::json!({
+                    "interrupted": interrupted,
+                    "unreconciled": unreconciled,
+                })),
+        )
+        .await;
+        Ok(())
     }
 
     /// Rebuilds the in-memory entries from durable records, so the committed
@@ -98,9 +113,13 @@ impl AllocationManager {
                 cleanup_only_profile(allocation)
             }
         };
-        self.set_error(allocation.id, "daemon restarted during allocation")
-            .await?;
-        self.ensure_terminal(allocation.id, profile, AllocationState::Failed)
+        if let Err(error) = self
+            .set_error(allocation.id, "daemon restarted during allocation")
+            .await
+        {
+            tracing::warn!(allocation_id = %allocation.id, %error, "cannot persist the recovery reason; cleanup will still run");
+        }
+        self.ensure_terminal(allocation.clone(), profile, AllocationState::Failed)
             .await?;
         tracing::info!(allocation_id = %allocation.id, "interrupted allocation recovered");
         Ok(())
@@ -118,17 +137,20 @@ pub(crate) fn cleanup_only_profile(allocation: &Allocation) -> Profile {
         allowed_workflows: BTreeSet::new(),
         allowed_events: BTreeSet::new(),
         allowed_refs: BTreeSet::new(),
-        allowed_ref_prefixes: BTreeSet::new(),
         require_protected_ref: true,
         network: NetworkMode::Default,
         cpu_count: 1,
         memory_mb: 2_048,
+        storage_mb: 40_960,
         boot_timeout_seconds: FALLBACK_CLEANUP_TIMEOUT_SECONDS,
         idle_timeout_seconds: FALLBACK_CLEANUP_TIMEOUT_SECONDS,
         job_timeout_seconds: FALLBACK_CLEANUP_TIMEOUT_SECONDS,
         cleanup_timeout_seconds: FALLBACK_CLEANUP_TIMEOUT_SECONDS,
         warm_template: None,
         regeneration_workflow: None,
+        // A cleanup-only profile authorizes nothing and must never be hot,
+        // the same reason its allowlists are empty.
+        hot: None,
         reap: false,
     }
 }

@@ -1,12 +1,33 @@
-//! Command-line model and local macOS service/configuration operations.
+//! Command-line parsing model and argument validation.
 
-mod cli;
-mod commands;
-mod paths;
+mod allocation;
+mod config;
+mod daemon;
+mod hot;
+mod image;
+mod overrides;
+mod profile;
+mod reaper;
+mod runtime;
+mod top;
+mod webui;
 
-pub use cli::{Arguments, DaemonCommand, TopCommand};
-pub use commands::{
-    run_allocation_command, run_config_command, run_daemon_command, run_profile_command,
-    run_reaper_command,
+pub use allocation::{AllocationCancelArgs, AllocationCommand, AllocationListArgs};
+pub use config::{ConfigBackend, ConfigCommand, ConfigGenerateArgs, ConfigViewArgs};
+pub use daemon::{DaemonCommand, DaemonControlArgs, DaemonLogsArgs, DaemonPrivArgs};
+pub use hot::{HotCommand, HotListArgs, HotRetireArgs};
+pub use image::{ImageCommand, ImageImportArgs, ImageInspectArgs};
+pub use overrides::ConfigOverrideArgument;
+pub use profile::{
+    NetworkArgument, ProfileCommand, ProfileCreateArgs, ProfileGetArgs, ProfileSetArgs,
 };
-pub use paths::selected_config_path;
+pub use reaper::{ReaperCommand, ReaperRunArgs};
+pub use runtime::{RuntimeCommand, RuntimeSmokeArgs};
+pub use top::{Arguments, TopCommand};
+pub use webui::{
+    WebuiArgs, WebuiCommand, WebuiUserAddArgs, WebuiUserCommand, WebuiUserListArgs,
+    WebuiUserNameArgs,
+};
+
+#[cfg(test)]
+mod tests;

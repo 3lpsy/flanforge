@@ -1,3 +1,4 @@
+use flanforge_core::first_field_error;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError, ValidationErrors};
@@ -63,9 +64,12 @@ pub(super) async fn bounded_json<T: serde::de::DeserializeOwned + Validate>(
         );
         ForgejoError::Malformed
     })?;
-    value.validate().map_err(|_| {
+    value.validate().map_err(|errors| {
+        let (field, code) = first_field_error(&errors);
         tracing::warn!(
             response_type = std::any::type_name::<T>(),
+            field,
+            code,
             "Forgejo response failed structural validation"
         );
         ForgejoError::Malformed
@@ -118,7 +122,14 @@ pub(super) struct RunnerRecord {
 pub(super) struct ActionRunJob {
     #[validate(range(min = 1))]
     pub(super) attempt: u32,
-    #[validate(custom(function = "validate_uuid"))]
+    /// The run this job belongs to. Optional here so a Forgejo that omits it
+    /// fails one named check at selection rather than every response at the
+    /// JSON boundary; selection refuses to bind without it either way.
+    #[serde(default)]
+    pub(super) run_id: Option<i64>,
+    /// Forgejo mints this as a UUID today but publishes it as opaque, so it is
+    /// bounded by shape rather than by format (CORE-321).
+    #[validate(custom(function = "validate_handle"))]
     pub(super) handle: String,
     #[validate(length(min = 1, max = 128))]
     #[validate(custom(function = "validate_text"))]
@@ -163,6 +174,23 @@ fn validate_uuid(value: &str) -> Result<(), ValidationError> {
         .map_err(|_| ValidationError::new("uuid"))
 }
 
+/// The bounded opaque-token shape shared by runner labels and the job handle.
+pub(super) fn is_opaque_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn validate_handle(value: &str) -> Result<(), ValidationError> {
+    if is_opaque_token(value) {
+        Ok(())
+    } else {
+        Err(ValidationError::new("handle"))
+    }
+}
+
 fn validate_runner_token(value: &str) -> Result<(), ValidationError> {
     if value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
@@ -191,15 +219,7 @@ fn validate_token(value: &str) -> Result<(), ValidationError> {
 }
 
 fn validate_runner_labels(values: &[String]) -> Result<(), ValidationError> {
-    if values.is_empty()
-        || values.len() > 32
-        || values.iter().any(|value| {
-            value.is_empty()
-                || value.len() > 128
-                || !value.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
-                })
-        })
+    if values.is_empty() || values.len() > 32 || !values.iter().all(|value| is_opaque_token(value))
     {
         Err(ValidationError::new("runner_labels"))
     } else {

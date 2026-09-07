@@ -1,0 +1,359 @@
+#!/bin/bash
+# Reset this guest between jobs and report the verdict as one JSON line.
+# Exit codes: 0 clean, 11 the machine failed, 64 usage.
+#
+# The macOS sibling of templates/libvirt/guest/flanforge-guest-recycle. Same
+# contract, same exit codes, same one JSON line; launchd, security, simctl and
+# dscl where the Linux one uses systemd, loginctl and cron. Keeping the
+# platform commands here is what lets the daemon run one named command with a
+# bounded timeout and know nothing about either process model.
+#
+# A failed recycle fails the machine, never the job: the caller evicts and the
+# next allocation clones. So every gate below is terminal, and there is no
+# retry code — waiting cannot make a dirty machine clean.
+set -Eeuo pipefail
+
+schema=1
+contract=1
+account_name=runner
+account_uid=0
+# Every path below is absolute under this prefix, which is empty in a guest.
+# Only the template's own test sets it, and the daemon's helper allow-list
+# admits no argument but --simulator-reset, so no caller can reach it.
+fixture_root=""
+
+# The image's own floor, not a knob: the guest knows its disk, and Xcode
+# DerivedData plus simulator runtimes are what fill it.
+min_free_mb=10240
+# A Mac that sleeps pauses its guests, and OIDC and TLS both care.
+max_skew_seconds=120
+
+usage() {
+  echo "usage: flanforge-guest-recycle --simulator-reset <none|apps|erase> | --self-test" >&2
+  exit 64
+}
+
+simulator_reset=""
+self_test=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --simulator-reset)
+      [ "$#" -ge 2 ] || usage
+      simulator_reset="$2"
+      shift 2
+      ;;
+    --self-test)
+      self_test=true
+      shift
+      ;;
+    --fixture-root)
+      [ "$#" -ge 2 ] || usage
+      fixture_root="$2"
+      shift 2
+      ;;
+    *) usage ;;
+  esac
+done
+if [ "${self_test}" = false ]; then
+  case "${simulator_reset}" in
+    none|apps|erase) ;;
+    *) usage ;;
+  esac
+fi
+if [ -n "${fixture_root}" ]; then
+  [[ "${fixture_root}" = /* && "${fixture_root}" != *..* ]] || usage
+fi
+
+jq_bin="${fixture_root}/usr/local/bin/jq"
+id_bin="${fixture_root}/usr/bin/id"
+kill_bin="${fixture_root}/bin/kill"
+pgrep_bin="${fixture_root}/usr/bin/pgrep"
+ps_bin="${fixture_root}/bin/ps"
+launchctl_bin="${fixture_root}/bin/launchctl"
+security_bin="${fixture_root}/usr/bin/security"
+simctl_bin="${fixture_root}/usr/bin/xcrun"
+crontab_bin="${fixture_root}/usr/bin/crontab"
+diskutil_bin="${fixture_root}/usr/sbin/diskutil"
+mount_bin="${fixture_root}/sbin/mount"
+timeout_bin="${fixture_root}/usr/local/bin/timeout"
+df_bin="${fixture_root}/bin/df"
+sntp_bin="${fixture_root}/usr/bin/sntp"
+tailscale_bin="${fixture_root}/opt/homebrew/bin/tailscale"
+account_home="${fixture_root}/Users/${account_name}"
+runner_bin="${account_home}/bin/forgejo-runner"
+
+# One line, bounded, and built field by field so no guest byte can forge JSON.
+emit() {
+  local gate="$1" state="$2" detail="$3" code="$4" clean="$5"
+  detail="$(printf '%s' "${detail}" | tr -c '\40-\176' ' ' | cut -c1-256)"
+  "${jq_bin}" -cn \
+    --argjson schema "${schema}" \
+    --argjson contract "${contract}" \
+    --argjson clean "${clean}" \
+    --arg gate "${gate}" \
+    --arg state "${state}" \
+    --arg detail "${detail}" \
+    --arg account "${account_name}" \
+    --argjson uid "${account_uid}" \
+    --argjson free_mb "${free_mb:-0}" \
+    --argjson skew_seconds "${skew_seconds:-0}" \
+    '{
+      schema: $schema, contract: $contract, clean: $clean, gate: $gate,
+      state: $state, detail: $detail,
+      free_mb: $free_mb, skew_seconds: $skew_seconds,
+      job_account: {name: $account, uid: $uid}
+    }'
+  exit "${code}"
+}
+
+for tool in "${jq_bin}" "${id_bin}" "${kill_bin}" "${pgrep_bin}" "${ps_bin}" \
+  "${launchctl_bin}" "${security_bin}" "${timeout_bin}" "${df_bin}"; do
+  if [ ! -x "${tool}" ]; then
+    # jq itself may be the missing tool, so this one report is hand-built from
+    # a path reduced to characters that cannot escape a JSON string.
+    tool_text="$(printf '%s' "${tool}" | tr -cd 'A-Za-z0-9/._-' | cut -c1-200)"
+    echo "missing guest tool ${tool}" >&2
+    printf '{"schema":%s,"contract":%s,"clean":false,"gate":"self-test","state":"absent","detail":"missing guest tool %s","free_mb":0,"skew_seconds":0,"job_account":{"name":"","uid":0}}\n' \
+      "${schema}" "${contract}" "${tool_text}"
+    exit 11
+  fi
+done
+
+# The account is baked by provision-runner-user.sh, so its uid is read rather
+# than assumed: a wrong uid would scope every kill and every find elsewhere.
+account_uid="$("${id_bin}" -u "${account_name}" 2>/dev/null || printf '')"
+if ! [[ "${account_uid}" =~ ^[0-9]{1,7}$ ]] || [ "${account_uid}" -lt 500 ]; then
+  account_uid=0
+  emit account invalid "job account ${account_name} is missing or privileged" 11 false
+fi
+
+if [ "${self_test}" = true ]; then
+  emit self-test ok "" 0 false
+fi
+
+as_root=true
+if [ "$("${id_bin}" -u)" -ne 0 ]; then
+  as_root=false
+fi
+
+# The daemon reaches this over SSH as the job account, and this image grants
+# that account no sudo. Almost everything the reset touches is that account's
+# own — its home, its keychain, its launchd domain, its tailnet session — so it
+# is changed directly rather than through an elevation that does not exist. The
+# handful of steps that really are root's go through `root_only` below.
+# Output is discarded here rather than at every call site: every caller is a
+# mutation, and one that printed would land in the middle of the JSON line.
+mutate() {
+  "$@" >/dev/null 2>&1 || true
+}
+
+# The few steps that genuinely need root. Over SSH they are skipped, and the
+# verify gates below are what decide whether that was enough.
+root_only() {
+  [ "${as_root}" = true ] || return 0
+  "$@" >/dev/null 2>&1 || true
+}
+
+# Our own ancestry, taken before anything is killed. Over SSH the reset runs as
+# the job account, so this process, its shell, and the session that carried it
+# all belong to that account legitimately. They are excluded by pid, never by
+# command name: a name filter is defeated by a job that calls its daemon "bash".
+own_pids=" "
+walk_pid=$$
+while [ "${walk_pid}" -gt 1 ]; do
+  own_pids="${own_pids}${walk_pid} "
+  walk_pid="$("${ps_bin}" -o ppid= -p "${walk_pid}" 2>/dev/null | tr -cd '0-9')"
+  [ -n "${walk_pid}" ] || break
+done
+
+# The listing is taken through a plain redirection into this file, never a
+# `$( )`: a command substitution forks a copy of this shell, which is owned by
+# the job account and alive while pgrep runs, so the gate would count itself.
+survivor_file="$(mktemp "${fixture_root}/tmp/flanforge-recycle.XXXXXX" 2>/dev/null || printf '')"
+[ -n "${survivor_file}" ] \
+  || emit processes unreadable "the job account's process listing cannot be taken" 11 false
+trap 'rm -f "${survivor_file}"' EXIT
+
+# Everything the job account owns that is not this reset, as both a killable
+# pid list and a reportable one. Re-taken rather than cached: the kill step and
+# the verify gate are the same question asked before and after.
+survivor_list=""
+kill_pids=""
+ensure_job_processes() {
+  local pid name
+  survivor_list=""
+  kill_pids=""
+  "${pgrep_bin}" -u "${account_uid}" -l > "${survivor_file}" 2>/dev/null || true
+  while read -r pid name; do
+    [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+    case "${own_pids}" in *" ${pid} "*) continue ;; esac
+    survivor_list="${survivor_list}${pid} ${name} "
+    kill_pids="${kill_pids}${pid} "
+  done < "${survivor_file}"
+}
+
+# 1. Simulator state, before the processes that own it are killed. This is
+#    where the speed comes from and the honest tradeoff sits.
+simulator_state="${simulator_reset}"
+if [ -x "${simctl_bin}" ] && [ "${simulator_reset}" != none ]; then
+  if [ "${simulator_reset}" = erase ]; then
+    # Shut down, erase, and let the next job boot: gives back most of what hot
+    # was meant to save, for a profile that wants machine reuse without
+    # simulator reuse.
+    "${timeout_bin}" 180 "${simctl_bin}" simctl shutdown all >/dev/null 2>&1 || true
+    "${timeout_bin}" 300 "${simctl_bin}" simctl erase all >/dev/null 2>&1 || true
+  else
+    # Keep the devices booted and drop the apps the job installed, which keeps
+    # the multi-minute boot and drops the obvious carryover.
+    while read -r device; do
+      [ -n "${device}" ] || continue
+      while read -r bundle; do
+        [ -n "${bundle}" ] || continue
+        "${timeout_bin}" 60 "${simctl_bin}" simctl uninstall "${device}" "${bundle}" \
+          >/dev/null 2>&1 || true
+      done < <("${timeout_bin}" 60 "${simctl_bin}" simctl listapps "${device}" 2>/dev/null \
+        | awk -F'"' '/CFBundleIdentifier/ { print $(NF - 1) }' \
+        | grep -v '^com\.apple\.' || true)
+    done < <("${timeout_bin}" 60 "${simctl_bin}" simctl list devices booted -j 2>/dev/null \
+      | "${jq_bin}" -r '.devices | to_entries[] | .value[] | .udid' 2>/dev/null || true)
+  fi
+fi
+
+# 2. Every process the job account owns. On macOS that is the runner user's
+#    launchd domain, not just a kill, because a job can install a LaunchAgent
+#    and persist itself.
+while read -r agent; do
+  [ -n "${agent}" ] || continue
+  label="$(basename "${agent}")"
+  label="${label%.plist}"
+  mutate "${launchctl_bin}" bootout "gui/${account_uid}/${label}"
+done < <(find "${account_home}/Library/LaunchAgents" -maxdepth 1 -name '*.plist' \
+  2>/dev/null || true)
+mutate rm -rf "${account_home}/Library/LaunchAgents"
+# User cron and at, which outlive a launchd domain teardown. `-u` is root's
+# spelling of it; as the account itself the bare form is the same edit.
+if [ -x "${crontab_bin}" ]; then
+  if [ "${as_root}" = true ]; then
+    mutate "${crontab_bin}" -r -u "${account_name}"
+  else
+    mutate "${crontab_bin}" -r
+  fi
+fi
+root_only rm -f "${fixture_root}/usr/lib/cron/tabs/${account_name}"
+# Killed by pid rather than by `pkill -u`, which matches this reset's own
+# shell, its login session and the sshd that carried it: the gate would die
+# before it could report.
+ensure_job_processes
+if [ -n "${kill_pids}" ]; then
+  # shellcheck disable=SC2086
+  mutate "${kill_bin}" -KILL ${kill_pids}
+fi
+
+# 3. Mounts the job added, including disk images, before the paths under them
+#    are removed: unlinking through a live mount would delete the wrong files.
+if [ -x "${mount_bin}" ] && [ -x "${diskutil_bin}" ]; then
+  while read -r target; do
+    case "${target}" in
+      "${fixture_root}/Volumes"/*)
+        mutate "${diskutil_bin}" unmount force "${target}"
+        ;;
+    esac
+  done < <("${mount_bin}" 2>/dev/null | awk '{ print $3 }' || true)
+fi
+
+# 4. The workspace and everything a job writes. The runner binary, the runner
+#    account, the toolchain caches, and the simulator runtimes are deliberately
+#    not here: removing those removes the entire point.
+mutate rm -rf \
+  "${account_home}/_work" \
+  "${account_home}/_actions" \
+  "${account_home}/_temp" \
+  "${account_home}/actions-runner"
+find "${fixture_root}/tmp" -mindepth 1 -maxdepth 1 -user "${account_uid}" \
+  -exec rm -rf {} + >/dev/null 2>&1 || true
+find "${fixture_root}/private/var/folders" -maxdepth 4 -user "${account_uid}" \
+  -name 'T' -type d -exec find {} -mindepth 1 -maxdepth 1 -exec rm -rf {} + \; \
+  >/dev/null 2>&1 || true
+
+# 5. Credential caches. The keychain the job unlocked or added to goes whole:
+#    a per-item denylist cannot bound what a job put there.
+mutate rm -f \
+  "${account_home}/Library/Keychains/login.keychain-db" \
+  "${account_home}/Library/Keychains/login.keychain" \
+  "${account_home}/.netrc" \
+  "${account_home}/.git-credentials" \
+  "${account_home}/.docker/config.json" \
+  "${account_home}/.config/gh/hosts.yml"
+rm -f "${fixture_root}"/tmp/flanforged-one-job-token.* >/dev/null 2>&1 || true
+rm -f "${fixture_root}"/tmp/flanforged-tailscale-preauth-key.* >/dev/null 2>&1 || true
+
+# 6. The regeneration sentinel. A regeneration never runs hot, so this can only
+#    be a forgery, and leaving it costs nothing to remove.
+mutate rm -f "${account_home}/.flanforge-regeneration-complete"
+
+# 7. The Tailscale session. The image makes the job account the tailnet
+#    operator, so this is its own session to drop; the next allocation brings
+#    its own pre-auth key.
+if [ -x "${tailscale_bin}" ]; then
+  mutate "${timeout_bin}" 30 "${tailscale_bin}" logout
+fi
+
+# --- Verify. Nothing above decides the verdict; everything below does. ---
+
+# The clock, resynced then re-checked. A Mac that sleeps pauses its guests, and
+# both OIDC and TLS reject on that alone. Setting the clock is root's, so over
+# SSH a skew that survives fails the machine rather than being papered over.
+skew_seconds=0
+if [ -x "${sntp_bin}" ]; then
+  measure_skew() {
+    "${timeout_bin}" 20 "${sntp_bin}" time.apple.com 2>/dev/null \
+      | awk '/[+-][0-9]+\.[0-9]+/ { for (i = 1; i <= NF; i++) if ($i ~ /^[+-][0-9]+\.[0-9]+$/) { v = $i; if (v < 0) v = -v; printf "%d", v; exit } }'
+  }
+  skew_seconds="$(measure_skew || printf '')"
+  [[ "${skew_seconds}" =~ ^[0-9]+$ ]] || skew_seconds=0
+  if [ "${skew_seconds}" -gt "${max_skew_seconds}" ]; then
+    root_only "${timeout_bin}" 30 "${sntp_bin}" -sS time.apple.com
+    skew_seconds="$(measure_skew || printf '')"
+    [[ "${skew_seconds}" =~ ^[0-9]+$ ]] || skew_seconds=0
+  fi
+  [ "${skew_seconds}" -le "${max_skew_seconds}" ] \
+    || emit clock skewed "clock is ${skew_seconds}s out after a resync" 11 false
+fi
+
+# Free disk. A hot guest fills up over twenty jobs, and a full disk fails the
+# job rather than the machine, which is the wrong way round.
+free_mb="$("${df_bin}" -m "${account_home}" 2>/dev/null | awk 'NR == 2 { print $4 }' || true)"
+[[ "${free_mb}" =~ ^[0-9]+$ ]] || free_mb=0
+[ "${free_mb}" -ge "${min_free_mb}" ] \
+  || emit disk full "only ${free_mb}MB free, below the ${min_free_mb}MB floor" 11 false
+
+# The runner binary is still there and still answers, which is the same check
+# `ensure_runner_available` makes before every job.
+[ -x "${runner_bin}" ] \
+  || emit runner missing "the image-installed runner is not executable" 11 false
+"${runner_bin}" one-job --help >/dev/null 2>&1 \
+  || emit runner incompatible "the image-installed runner rejected one-job" 11 false
+
+# The tailnet identity, which the logout above was meant to drop. Every other
+# credential-shaped thing is a file the reset removed and this one is not, so
+# it is the only one that needs asking rather than doing.
+if [ -x "${tailscale_bin}" ]; then
+  tailscale_state="$("${timeout_bin}" 20 "${tailscale_bin}" status --json 2>/dev/null \
+    | "${jq_bin}" -r '.BackendState // ""' 2>/dev/null || printf '')"
+  tailscale_state="$(printf '%s' "${tailscale_state}" | tr -cd 'A-Za-z' | cut -c1-32)"
+  case "${tailscale_state}" in
+    ""|NeedsLogin|NoState) ;;
+    *) emit tailscale bound \
+      "the tailnet session survived the logout (${tailscale_state})" 11 false ;;
+  esac
+fi
+
+# The gate the whole reset is for: anything the job account still owns that is
+# not this reset itself is the previous job, still present.
+ensure_job_processes
+survivors="$(printf '%s' "${survivor_list}" | cut -c1-200)"
+if [ -n "${survivors}" ]; then
+  emit processes surviving "the job account still owns processes: ${survivors}" 11 false
+fi
+
+emit clean "${simulator_state}" "" 0 true

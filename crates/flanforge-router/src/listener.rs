@@ -74,6 +74,7 @@ impl Listener for BoundedListener {
 #[derive(Debug)]
 pub struct BoundedStream {
     stream: TcpStream,
+    head_timeout: Duration,
     _permit: OwnedSemaphorePermit,
     head: Option<HeadDeadline>,
 }
@@ -83,10 +84,32 @@ impl BoundedStream {
         Self {
             stream,
             _permit: permit,
-            head: Some(HeadDeadline {
-                sleep: Box::pin(tokio::time::sleep(head_timeout)),
-                matched: 0,
-            }),
+            head_timeout,
+            head: Some(HeadDeadline::new(head_timeout, true)),
+        }
+    }
+
+    /// Writing a response ends the exchange, so the next request head is
+    /// bounded again. Without this the deadline disarmed permanently at the
+    /// first head, and an idle keep-alive connection held its slot for as long
+    /// as the peer liked — enough of them exhaust the bound before any request
+    /// is authorized, and none of them need a credential to get there.
+    fn await_next_head(&mut self, context: &mut Context<'_>) {
+        match self.head.as_mut() {
+            // Already waiting on a head: the exchange is still in flight, so
+            // only the deadline moves. Partial match progress is kept.
+            Some(head) => head
+                .sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + self.head_timeout),
+            None => self.head = Some(HeadDeadline::new(self.head_timeout, false)),
+        }
+        // The deadline is checked in `poll_read`, but the peer has gone quiet
+        // by definition, so nothing else will wake this task. Polling the
+        // timer here registers its waker against the live connection, which is
+        // what lets an idle connection be reaped at all.
+        if let Some(head) = self.head.as_mut() {
+            let _ = head.sleep.as_mut().poll(context);
         }
     }
 }
@@ -95,9 +118,21 @@ impl BoundedStream {
 struct HeadDeadline {
     sleep: Pin<Box<Sleep>>,
     matched: usize,
+    /// Whether this is the connection's first head. A later one is a
+    /// keep-alive idle wait, which is reaped as a clean close rather than
+    /// reported as a peer that failed to deliver.
+    is_first: bool,
 }
 
 impl HeadDeadline {
+    fn new(timeout: Duration, is_first: bool) -> Self {
+        Self {
+            sleep: Box::pin(tokio::time::sleep(timeout)),
+            matched: 0,
+            is_first,
+        }
+    }
+
     /// Advances the end-of-head match across reads that may split it.
     fn is_complete(&mut self, bytes: &[u8]) -> bool {
         for byte in bytes {
@@ -124,10 +159,17 @@ impl AsyncRead for BoundedStream {
         if let Some(head) = this.head.as_mut()
             && head.sleep.as_mut().poll(context).is_ready()
         {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "request head was not delivered in time",
-            )));
+            return if head.is_first {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "request head was not delivered in time",
+                )))
+            } else {
+                // An idle keep-alive peer is reaped, not faulted: it did
+                // nothing wrong, it is just holding a slot someone else needs.
+                // An empty read is end-of-stream, so the connection closes.
+                Poll::Ready(Ok(()))
+            };
         }
         let start = buffer.filled().len();
         let result = Pin::new(&mut this.stream).poll_read(context, buffer);
@@ -147,7 +189,9 @@ impl AsyncWrite for BoundedStream {
         context: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write(context, buffer)
+        let this = self.get_mut();
+        this.await_next_head(context);
+        Pin::new(&mut this.stream).poll_write(context, buffer)
     }
 
     fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -163,7 +207,9 @@ impl AsyncWrite for BoundedStream {
         context: &mut Context<'_>,
         buffers: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write_vectored(context, buffers)
+        let this = self.get_mut();
+        this.await_next_head(context);
+        Pin::new(&mut this.stream).poll_write_vectored(context, buffers)
     }
 
     fn is_write_vectored(&self) -> bool {

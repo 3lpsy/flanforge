@@ -4,8 +4,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use flanforge_config::load_config;
+use flanforge_config::{ConfigOverrides, load_config_with_overrides};
 use flanforge_manager::ConfigHandle;
+use flanforge_store::{Event, EventKind, EventSink};
 use tokio_util::sync::CancellationToken;
 
 /// Fallback watch period, fixed: a reload trigger is not policy.
@@ -26,6 +27,9 @@ pub(super) fn spawn_config_reload(
     config_path: PathBuf,
     stamp: FileStamp,
     handle: Arc<ConfigHandle>,
+    overrides: ConfigOverrides,
+    events: Arc<dyn EventSink>,
+    reload_now: Arc<tokio::sync::Notify>,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -35,6 +39,9 @@ pub(super) fn spawn_config_reload(
             let trigger = tokio::select! {
                 () = shutdown.cancelled() => return,
                 () = wait_for_hangup(&mut hangup) => "sighup",
+                // The webui's edit endpoint nudges here after it writes, so
+                // the change applies now rather than at the next tick.
+                () = reload_now.notified() => "api",
                 () = tokio::time::sleep(WATCH_INTERVAL) => {
                     if file_stamp(&config_path).await == stamp {
                         continue;
@@ -42,7 +49,7 @@ pub(super) fn spawn_config_reload(
                     "file"
                 }
             };
-            stamp = reload(&config_path, &handle, trigger).await;
+            stamp = reload(&config_path, &handle, &overrides, &events, trigger).await;
         }
     });
 }
@@ -50,8 +57,14 @@ pub(super) fn spawn_config_reload(
 /// Loads, validates, and applies; a failure changes nothing. Returns the stamp
 /// taken *before* the read, so a write landing during the reload is seen on the
 /// next tick instead of being recorded as already applied.
-async fn reload(path: &Path, handle: &ConfigHandle, trigger: &'static str) -> FileStamp {
-    let (stamp, loaded) = read_stamped(path).await;
+async fn reload(
+    path: &Path,
+    handle: &ConfigHandle,
+    overrides: &ConfigOverrides,
+    events: &Arc<dyn EventSink>,
+    trigger: &'static str,
+) -> FileStamp {
+    let (stamp, loaded) = read_stamped(path, overrides).await;
     let config = match loaded {
         Ok(config) => config,
         Err(error) => {
@@ -64,6 +77,15 @@ async fn reload(path: &Path, handle: &ConfigHandle, trigger: &'static str) -> Fi
     match handle.apply(Arc::new(config)) {
         Ok(generation) => {
             tracing::debug!(trigger, generation, "configuration replaced");
+            events
+                .record(
+                    Event::new(EventKind::ConfigReloaded).with_payload(&serde_json::json!({
+                        "generation": generation,
+                        "trigger": trigger,
+                        "restart_pending": handle.restart_pending(),
+                    })),
+                )
+                .await;
             if let Err(error) = flanforge_logging::configure(&level, log_path.as_deref()) {
                 tracing::warn!(%error, "cannot apply the reloaded logging settings");
             }
@@ -79,12 +101,13 @@ async fn reload(path: &Path, handle: &ConfigHandle, trigger: &'static str) -> Fi
 /// before what was decoded; a later write compares unequal and reloads again.
 pub(super) async fn read_stamped(
     path: &Path,
+    overrides: &ConfigOverrides,
 ) -> (
     FileStamp,
     Result<flanforge_core::Config, flanforge_config::ConfigLoadError>,
 ) {
     let stamp = file_stamp(path).await;
-    (stamp, load_config(path).await)
+    (stamp, load_config_with_overrides(path, overrides).await)
 }
 
 pub(super) async fn file_stamp(path: &Path) -> FileStamp {

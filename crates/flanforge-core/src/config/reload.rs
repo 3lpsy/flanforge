@@ -1,6 +1,19 @@
-use super::Config;
+use super::{Config, GuestSshConfig, Profile};
 
 type Difference = (bool, &'static str);
+
+/// Fields the native service definition bakes in at install time, so a restart
+/// alone re-reads the old value. `shutdown_grace_seconds` becomes launchd's
+/// `ExitTimeOut` and systemd's `TimeoutStopSec`; `db.db_path` is baked into the
+/// systemd unit's `ReadWritePaths`.
+const SERVICE_DEFINITION_FIELDS: &[&str] = &["server.shutdown_grace_seconds", "db.db_path"];
+
+/// Returns whether applying a changed field needs `daemon install`, not just a
+/// restart.
+#[must_use]
+pub fn is_service_definition_field(field: &str) -> bool {
+    SERVICE_DEFINITION_FIELDS.contains(&field)
+}
 
 /// Names every restart-only field whose value differs, in declaration order.
 ///
@@ -10,11 +23,29 @@ type Difference = (bool, &'static str);
 pub fn restart_only_differences(old: &Config, new: &Config) -> Vec<&'static str> {
     server_differences(old, new)
         .into_iter()
+        .chain(db_differences(old, new))
+        .chain(webui_differences(old, new))
         .chain(endpoint_differences(old, new))
         .chain(runtime_differences(old, new))
         .chain(guest_differences(old, new))
         .filter_map(|(differs, field)| differs.then_some(field))
         .collect()
+}
+
+/// Whether a reload's change to this profile invalidates a hot machine already
+/// running under it. A running machine cannot be resized under a claim, and a
+/// machine sized by a superseded profile is not the machine the operator
+/// configured. One predicate with its own tests, rather than a field list
+/// open-coded at the drain site.
+#[must_use]
+pub fn is_hot_draining_change(old: &Profile, new: &Profile) -> bool {
+    old.cpu_count != new.cpu_count
+        || old.memory_mb != new.memory_mb
+        || old.storage_mb != new.storage_mb
+        || old.network != new.network
+        || old.template != new.template
+        || old.warm_template != new.warm_template
+        || old.hot != new.hot
 }
 
 fn server_differences(old: &Config, new: &Config) -> Vec<Difference> {
@@ -33,6 +64,35 @@ fn server_differences(old: &Config, new: &Config) -> Vec<Difference> {
             old.shutdown_grace_seconds != new.shutdown_grace_seconds,
             "server.shutdown_grace_seconds",
         ),
+    ]
+}
+
+fn db_differences(old: &Config, new: &Config) -> Vec<Difference> {
+    vec![(old.db.db_path != new.db.db_path, "db.db_path")]
+}
+
+// `webui.public_read_only` is deliberately absent: guards read it through the
+// reloadable handle, so a reload applies it.
+fn webui_differences(old: &Config, new: &Config) -> Vec<Difference> {
+    let (old, new) = (&old.webui, &new.webui);
+    vec![
+        (old.enabled != new.enabled, "webui.enabled"),
+        (
+            old.session_ttl_seconds != new.session_ttl_seconds,
+            "webui.session_ttl_seconds",
+        ),
+        (
+            old.request_body_limit_bytes != new.request_body_limit_bytes,
+            "webui.request_body_limit_bytes",
+        ),
+        (old.dev_dist_dir != new.dev_dist_dir, "webui.dev_dist_dir"),
+        (
+            old.authdb.enabled != new.authdb.enabled,
+            "webui.authdb.enabled",
+        ),
+        // Any change to the relying-party table is reported once, by its name:
+        // the client, secret, and endpoints are read when the surface starts.
+        (old.oidc != new.oidc, "webui.oidc"),
     ]
 }
 
@@ -70,15 +130,10 @@ fn runtime_differences(old: &Config, new: &Config) -> Vec<Difference> {
     let (old, new) = (&old.runtime, &new.runtime);
     vec![
         (old.state_dir != new.state_dir, "runtime.state_dir"),
-        (old.tart_path != new.tart_path, "runtime.tart_path"),
+        (old.backend != new.backend, "runtime.backend"),
         (old.ssh_path != new.ssh_path, "runtime.ssh_path"),
         (old.scp_path != new.scp_path, "runtime.scp_path"),
-        (
-            old.forgejo_runner_host_path != new.forgejo_runner_host_path,
-            "runtime.forgejo_runner_host_path",
-        ),
         (old.vm_prefix != new.vm_prefix, "runtime.vm_prefix"),
-        (old.tart_home != new.tart_home, "runtime.tart_home"),
         (
             old.max_running_vms != new.max_running_vms,
             "runtime.max_running_vms",
@@ -97,31 +152,47 @@ fn runtime_differences(old: &Config, new: &Config) -> Vec<Difference> {
 fn guest_differences(old: &Config, new: &Config) -> Vec<Difference> {
     let (old_guest, new_guest) = (&old.guest, &new.guest);
     let (old_tailscale, new_tailscale) = (&old.tailscale, &new.tailscale);
+    let (old_ssh, new_ssh) = (old_guest.ssh.as_ref(), new_guest.ssh.as_ref());
     vec![
-        (old_guest.ssh_user != new_guest.ssh_user, "guest.ssh_user"),
+        (old_guest.channel != new_guest.channel, "guest.channel"),
         (
-            old_guest.ssh_identity_file != new_guest.ssh_identity_file,
-            "guest.ssh_identity_file",
+            old_guest.runner_user != new_guest.runner_user,
+            "guest.runner_user",
         ),
         (
-            old_guest.ssh_known_hosts_file != new_guest.ssh_known_hosts_file,
-            "guest.ssh_known_hosts_file",
-        ),
-        (
-            old_guest.ssh_host_key_alias != new_guest.ssh_host_key_alias,
-            "guest.ssh_host_key_alias",
+            old_guest.privileged_user != new_guest.privileged_user,
+            "guest.privileged_user",
         ),
         (
             old_guest.forgejo_runner_path != new_guest.forgejo_runner_path,
             "guest.forgejo_runner_path",
         ),
+        // A table that appears or disappears is reported once, by its own name:
+        // the dotted keys below have nothing to compare against.
+        (old_ssh.is_some() != new_ssh.is_some(), "guest.ssh"),
         (
-            old_guest.ssh_connect_timeout_seconds != new_guest.ssh_connect_timeout_seconds,
-            "guest.ssh_connect_timeout_seconds",
+            is_ssh_field_changed(old_ssh, new_ssh, |ssh| &ssh.identity_file),
+            "guest.ssh.identity_file",
         ),
         (
-            old_guest.verify_host_key != new_guest.verify_host_key,
-            "guest.verify_host_key",
+            is_ssh_field_changed(old_ssh, new_ssh, |ssh| &ssh.privileged_identity_file),
+            "guest.ssh.privileged_identity_file",
+        ),
+        (
+            is_ssh_field_changed(old_ssh, new_ssh, |ssh| &ssh.known_hosts_file),
+            "guest.ssh.known_hosts_file",
+        ),
+        (
+            is_ssh_field_changed(old_ssh, new_ssh, |ssh| &ssh.host_key_alias),
+            "guest.ssh.host_key_alias",
+        ),
+        (
+            is_ssh_field_changed(old_ssh, new_ssh, |ssh| &ssh.connect_timeout_seconds),
+            "guest.ssh.connect_timeout_seconds",
+        ),
+        (
+            is_ssh_field_changed(old_ssh, new_ssh, |ssh| &ssh.verify_host_key),
+            "guest.ssh.verify_host_key",
         ),
         (
             old_tailscale.enabled != new_tailscale.enabled,
@@ -144,4 +215,14 @@ fn guest_differences(old: &Config, new: &Config) -> Vec<Difference> {
             "tailscale.extra_args",
         ),
     ]
+}
+
+/// A field inside `[guest.ssh]` differs only when both documents have the
+/// table; its appearance or removal is reported as `guest.ssh` instead.
+fn is_ssh_field_changed<T: PartialEq + ?Sized>(
+    old: Option<&GuestSshConfig>,
+    new: Option<&GuestSshConfig>,
+    field: impl for<'a> Fn(&'a GuestSshConfig) -> &'a T,
+) -> bool {
+    matches!((old, new), (Some(old), Some(new)) if field(old) != field(new))
 }

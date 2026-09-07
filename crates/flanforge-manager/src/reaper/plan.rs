@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use flanforge_core::{
-    Allocation, AllocationId, AllocationMode, Config, PREVIOUS_SUFFIX, ProfileName, STAGING_SUFFIX,
-    VmName, WarmImageRecord,
+    Allocation, AllocationId, AllocationMode, Config, HotGuest, PREVIOUS_SUFFIX, ProfileName,
+    STAGING_SUFFIX, VmName, WarmImageRecord,
 };
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +23,9 @@ pub enum ReapAuthorization {
     Record(AllocationId),
     Staging(ProfileName),
     Image(ProfileName),
-    /// Reported at WARN, never deleted.
+    /// The configured `runtime.vm_prefix`, which is the documented ownership
+    /// boundary: a prefixed name no record and no live allocation claims is an
+    /// orphan of the daemon's own making, and collectable.
     Prefix,
 }
 
@@ -41,6 +43,7 @@ pub struct ReapInputs<'a> {
     pub machines: &'a [HostMachine],
     pub allocations: &'a [Allocation],
     pub images: &'a [WarmImageRecord],
+    pub hot: &'a [HotGuest],
 }
 
 /// Turns one snapshot into typed candidates. Deletes nothing.
@@ -56,8 +59,28 @@ pub fn plan_sweep(inputs: ReapInputs<'_>) -> Vec<ReapCandidate> {
         .collect()
 }
 
+/// Prefix-owned names the sweep had to drop because no age is determinable.
+/// The age gate cannot be applied to them, so they are never swept; reporting
+/// them keeps a VM the daemon can never collect visible rather than silent.
+#[must_use]
+pub fn unaged_candidates(inputs: ReapInputs<'_>) -> Vec<String> {
+    let protected = protected_names(&inputs);
+    let prefix = inputs.config.runtime.vm_prefix.as_str();
+    inputs
+        .machines
+        .iter()
+        .filter(|machine| {
+            machine.age_seconds.is_none()
+                && machine.name.starts_with(prefix)
+                && !protected.contains(&machine.name)
+        })
+        .map(|machine| machine.name.clone())
+        .collect()
+}
+
 /// Names no sweep may consider: anything an active allocation is bound to,
-/// every configured template, and every image a live profile still references.
+/// every machine a live hot record claims, every configured template, and
+/// every image a live profile still references.
 fn protected_names(inputs: &ReapInputs<'_>) -> BTreeSet<String> {
     let mut protected = BTreeSet::new();
     for allocation in inputs.allocations {
@@ -73,6 +96,17 @@ fn protected_names(inputs: &ReapInputs<'_>) -> BTreeSet<String> {
             protected.extend(derived_names(warm));
         }
     }
+    // A hot machine belongs to its record, not to an allocation. Without this
+    // the sweep deletes an idle pool machine under `ReapAuthorization::Prefix`
+    // the moment it crosses the age floor. `Evicted` deliberately does not
+    // protect: its machine is abandoned, and the prefix collects it.
+    protected.extend(
+        inputs
+            .hot
+            .iter()
+            .filter(|guest| guest.state.is_holding_machine())
+            .map(|guest| guest.vm_name.to_string()),
+    );
     protected.extend(reserved_image_names(inputs.config));
     protected
 }
@@ -98,7 +132,8 @@ fn candidate(
     machine: &HostMachine,
     prefix: &str,
 ) -> Option<ReapCandidate> {
-    // An undeterminable age is skipped: the sweep never guesses at ownership.
+    // No age, no candidacy: the minimum-age gate is what keeps an allocation
+    // still being set up out of the sweep. `unaged_candidates` reports these.
     let age_seconds = machine.age_seconds?;
     if age_seconds < MIN_AGE_SECONDS {
         return None;
@@ -116,8 +151,9 @@ fn candidate(
     })
 }
 
-/// A prefix-shaped name is only deletable when a terminal record proves the
-/// daemon created it and its cleanup never finished.
+/// A terminal record that proves the daemon created the clone names the
+/// deletion; without one the configured prefix does, because a prefixed name
+/// nothing claims is an orphan this daemon left behind.
 fn clone_authorization(inputs: &ReapInputs<'_>, name: &str) -> ReapAuthorization {
     inputs
         .allocations

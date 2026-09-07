@@ -12,6 +12,11 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+mod hub;
+mod tee;
+
+pub use hub::{LogHub, LogLine};
+
 use tracing_subscriber::{
     EnvFilter, Registry,
     field::RecordFields,
@@ -24,6 +29,13 @@ use tracing_subscriber::{
 };
 
 static FILTER_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
+static LOG_HUB: OnceLock<LogHub> = OnceLock::new();
+
+/// The process-wide log tail the web UI streams from. Always present; empty
+/// until `init` installs the tee.
+pub fn log_hub() -> &'static LogHub {
+    LOG_HUB.get_or_init(LogHub::default)
+}
 static LOG_FILE: Mutex<Option<LogSink>> = Mutex::new(None);
 
 const QUIET_TARGETS: &[&str] = &["h2", "hyper", "reqwest", "rustls"];
@@ -49,6 +61,7 @@ pub fn init() {
         .with(filter)
         .with(stdout_layer)
         .with(file_layer)
+        .with(tee::HubLayer)
         .init();
 }
 

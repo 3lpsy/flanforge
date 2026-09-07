@@ -3,7 +3,7 @@
 # Nothing here ships: no release, no artifacts.
 #
 # Copy into a consumer repository and name it in the profile's
-# `regeneration_workflow`. See docs/PROFILE_BASE.md.
+# `regeneration_workflow`. See crates/flanforge-manager/README.md.
 name: regeneration
 
 on:
@@ -31,6 +31,8 @@ jobs:
       allocation_id: ${{ steps.allocate.outputs.allocation_id }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
       - name: Request a macOS allocation
         id: allocate
         env:
@@ -51,8 +53,8 @@ jobs:
     env:
       # Absolute, stable paths. The runner checks out into a different
       # directory every run, so anything keyed to the checkout is worthless to
-      # the next job — and the checkout is deleted before promotion, so a cache
-      # written under it never reaches the image at all.
+      # the next job. `persist-credentials: false` below keeps its runner token
+      # out of the workflow-owned guest state.
       CARGO_HOME: /Users/runner/.cargo
       CARGO_TARGET_DIR: /Users/runner/.cache/myproject-target
       SCCACHE_DIR: /Users/runner/.cache/sccache
@@ -67,7 +69,22 @@ jobs:
       # No window server session in the guest.
       HEADLESS: 1
     steps:
+      # Literal first step: invalidate any handoff inherited from the base
+      # before checkout or other fallible work can run.
+      - name: Reset inherited completion marker
+        run: |
+          set -euo pipefail
+          marker="$HOME/.flanforge-regeneration-complete"
+          if [ -L "$marker" ] || { [ -e "$marker" ] && [ ! -f "$marker" ]; }; then
+            echo "::error::Completion marker must be absent or a regular file at job start"
+            exit 1
+          fi
+          rm -f -- "$marker"
+          [ ! -e "$marker" ] && [ ! -L "$marker" ]
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
 
       - name: Prepare the cache directories
         run: |
@@ -82,7 +99,7 @@ jobs:
       # changed, so unchanged files keep their mtime. `cp` and `rsync -a` reset
       # every mtime, which invalidates incremental state as surely as a moving
       # path does. Fetch by filesystem path with no named remote, so no
-      # credential is ever written into a directory the strip does not cover.
+      # credential is ever written into the retained work directory.
       - name: Mirror the checkout into the stable build directory
         run: |
           set -euo pipefail
@@ -104,29 +121,61 @@ jobs:
           # ...and whatever produces your app's build products, so the Swift
           # compilation cache is populated too.
 
-      # The build directory is baked into the image and the strip is a fixed
-      # removal list that does not cover it, so anything secret-shaped left
-      # there reaches every future clone. Failing here refuses retention.
+      # The build directory is baked into the image unchanged, so anything
+      # secret-shaped left there reaches every future clone. Failing here
+      # refuses retention.
       - name: Refuse to bake credentials into the image
         run: |
           set -euo pipefail
-          hit="$(find "${WORK_DIR}" -maxdepth 3 \( -name '.env' -o -name '*.p12' \
-            -o -name '*.p8' -o -name '*.mobileprovision' \) -print 2>/dev/null \
-            | head -n1 || true)"
+          if ! hit="$(find "${WORK_DIR}" "${GITHUB_WORKSPACE}" -maxdepth 3 \
+            \( -name '.env' -o -name '*.p12' \
+            -o -name '*.p8' -o -name '*.mobileprovision' \) -print -quit)"; then
+            echo "::error::Credential scan could not inspect all retained paths"
+            exit 1
+          fi
           [ -z "${hit}" ] || { echo "::error::${hit} would be baked into the image"; exit 1; }
 
       - name: Report cache use
         if: always()
         run: sccache --show-stats || true
 
-      # Last step, and required. A guest runner can exit non-zero after
-      # completing its job, so reaching a terminal state is not evidence the
-      # build succeeded. Without this the daemon refuses to retain the guest.
-      # The strip verifies and removes it, so it never survives into the image.
+      # Literal last step, and required. Refusing an entry that reappeared and
+      # linking a fresh 0600 file prevents an earlier failure from reusing an
+      # inherited handoff. The daemon only verifies this regular marker; it
+      # leaves the guest and marker unchanged.
       - name: Mark the regeneration complete
-        run: touch "$HOME/.flanforge-regeneration-complete"
+        run: |
+          set -euo pipefail
+          marker="$HOME/.flanforge-regeneration-complete"
+          temporary=
+          committed=0
+          cleanup() {
+            cleanup_status=$?
+            if [ "$committed" -ne 1 ]; then
+              if [ -n "$temporary" ]; then
+                rm -f -- "$temporary" 2>/dev/null || true
+              fi
+              rm -f -- "$marker" 2>/dev/null || true
+            fi
+            return "$cleanup_status"
+          }
+          trap cleanup EXIT
+          if [ -e "$marker" ] || [ -L "$marker" ]; then
+            echo "::error::Completion marker reappeared before final handoff"
+            exit 1
+          fi
+          umask 077
+          temporary="$(mktemp "${marker}.tmp.XXXXXX")"
+          [ -f "$temporary" ] && [ ! -L "$temporary" ]
+          ln "$temporary" "$marker" \
+            || { echo "::error::Completion marker appeared during final handoff"; exit 1; }
+          chmod 0600 "$temporary"
+          [ "$temporary" -ef "$marker" ]
+          rm -f -- "$temporary"
+          temporary=
+          [ -f "$marker" ] && [ ! -L "$marker" ]
+          committed=1
 
       # Deliberately no cancellation job. Retention runs after this job's
       # runner exits, so cancelling the allocation aborts it and no image is
       # produced. The daemon releases the guest itself once it has promoted.
-

@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use flanforge_core::{Config, ConfigError, restart_only_differences};
+use flanforge_core::{Config, ConfigError, is_service_definition_field, restart_only_differences};
 use tokio::sync::watch;
 
 /// The running configuration, replaceable by a validated reload.
@@ -55,8 +55,20 @@ impl ConfigHandle {
     /// Returns the validation error of the replacement document.
     pub fn apply(&self, next: Arc<Config>) -> Result<u64, ConfigError> {
         next.ensure_valid()?;
+        // A reload that turns a profile risky must say so, not just the
+        // startup that did.
+        for advisory in next.advisories() {
+            tracing::warn!("{}", advisory.message());
+        }
         for field in restart_only_differences(&self.startup, &next) {
-            tracing::warn!(field, "configuration change requires a restart to apply");
+            if is_service_definition_field(field) {
+                tracing::warn!(
+                    field,
+                    "configuration change is baked into the native service definition; run `flanforged daemon install` to apply it, a restart alone will not"
+                );
+            } else {
+                tracing::warn!(field, "configuration change requires a restart to apply");
+            }
         }
         self.sender.send_replace(next);
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;

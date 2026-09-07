@@ -1,20 +1,19 @@
-use std::{net::IpAddr, path::Path};
+use std::path::Path;
 
 use thiserror::Error;
 use url::Url;
 
 use super::{
-    Config, guest::ensure_guest_valid, images::ensure_images_valid, logging::ensure_logging_valid,
+    Config, GuestChannelKind, RuntimeBackendKind, db::ensure_db_valid, guest::ensure_guest_valid,
+    hot::ensure_hot_valid, images::ensure_images_valid, logging::ensure_logging_valid,
     profile::ensure_profiles_valid, runtime::ensure_runtime_valid,
-    tailscale::ensure_tailscale_valid,
+    tailscale::ensure_tailscale_valid, webui::ensure_webui_valid,
 };
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ConfigError {
     #[error("at least one project profile is required")]
     NoProfiles,
-    #[error("server.listen must be loopback or a Tailscale address")]
-    UnsafeListenAddress,
     #[error("{field} is outside the allowed range")]
     OutOfRange { field: &'static str },
     #[error("{field} must be an absolute path without parent traversal")]
@@ -27,16 +26,40 @@ pub enum ConfigError {
     UnsafeValue { field: &'static str },
     #[error("profile {profile}: {message}")]
     InvalidProfile { profile: String, message: String },
-    #[error("runner labels and repositories must be unique across profiles")]
-    DuplicateProfileBinding,
+    #[error("runner labels must be unique across profiles")]
+    DuplicateRunnerLabel,
     #[error("tailscale.{field} is required when tailscale is enabled")]
     MissingTailscaleSetting { field: &'static str },
-    #[error("guest.{field} is required when guest.verify_host_key is enabled")]
+    #[error("guest.ssh.{field} is required when guest.ssh.verify_host_key is enabled")]
     MissingGuestSetting { field: &'static str },
+    #[error(
+        "{table} is required because guest.channel resolved to \"{channel}\" for the {backend} backend"
+    )]
+    MissingGuestTable {
+        table: &'static str,
+        backend: RuntimeBackendKind,
+        channel: GuestChannelKind,
+    },
+    #[error(
+        "guest.channel = \"agent\" cannot be used over an insecure libvirt transport: the runner \
+         registration token would cross qemu+tcp in clear text. Move runtime.backend.uri to \
+         qemu+ssh or qemu+tls, or set guest.channel = \"ssh\"."
+    )]
+    InsecureGuestChannelTransport,
     #[error("runtime.{field} is required when a profile declares a warm template")]
     MissingRuntimeSetting { field: &'static str },
+    #[error("{backend} does not support {capability}")]
+    UnsupportedBackendCapability {
+        backend: &'static str,
+        capability: &'static str,
+        profile: Option<String>,
+    },
     #[error("tailscale.extra_args is not a valid bounded argument string")]
     InvalidTailscaleArguments,
+    #[error("webui.oidc.{field} is required when webui.oidc is enabled")]
+    MissingWebuiOidcSetting { field: &'static str },
+    #[error("webui.oidc.redirect_url must point at /api/v1/oidc/callback with no query")]
+    InvalidWebuiRedirectUrl,
 }
 
 impl Config {
@@ -44,26 +67,27 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns an error for unsafe listeners, URLs, paths, limits, or profile
-    /// policy.
+    /// Returns an error for unsafe URLs, paths, limits, or profile policy.
     pub fn ensure_valid(&self) -> Result<(), ConfigError> {
         if self.profiles.is_empty() {
             return Err(ConfigError::NoProfiles);
         }
         ensure_logging_valid(&self.logging)?;
         self.ensure_server_valid()?;
+        ensure_db_valid(&self.db)?;
+        ensure_webui_valid(&self.webui)?;
         self.ensure_endpoints_valid()?;
         ensure_runtime_valid(self)?;
-        ensure_guest_valid(&self.guest)?;
+        ensure_guest_valid(self)?;
         ensure_tailscale_valid(&self.tailscale)?;
         ensure_profiles_valid(self)?;
-        ensure_images_valid(self)
+        ensure_images_valid(self)?;
+        ensure_hot_valid(self)
     }
 
+    // Where the daemon binds is the operator's call: OIDC on every allocation
+    // request is what authorizes callers, not the reachability of the socket.
     fn ensure_server_valid(&self) -> Result<(), ConfigError> {
-        if !is_safe_listen_ip(self.server.listen.ip()) {
-            return Err(ConfigError::UnsafeListenAddress);
-        }
         ensure_range(
             "server.request_body_limit_bytes",
             &self.server.request_body_limit_bytes,
@@ -125,12 +149,7 @@ pub(super) fn ensure_path(field: &'static str, path: &Path) -> Result<(), Config
                 .bytes()
                 .all(|byte| !byte.is_ascii_control() && !matches!(byte, b'"' | b'\\'))
     });
-    if !is_safe_text
-        || !path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
+    if !is_safe_text || flanforge_paths::ensure_absolute_normalized(path).is_err() {
         return Err(ConfigError::InvalidPath { field });
     }
     Ok(())
@@ -176,6 +195,7 @@ pub(super) fn ensure_safe_name(
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || value.contains("..")
     {
         return Err(ConfigError::UnsafeValue { field });
     }
@@ -195,19 +215,5 @@ where
         Ok(())
     } else {
         Err(ConfigError::OutOfRange { field })
-    }
-}
-
-fn is_safe_listen_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            ip.is_loopback() || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-        }
-        IpAddr::V6(ip) => {
-            let segments = ip.segments();
-            ip.is_loopback()
-                || (segments[0] == 0xfd7a && segments[1] == 0x115c && segments[2] == 0xa1e0)
-        }
     }
 }

@@ -10,12 +10,16 @@ axum = { workspace = true }
 flanforge-auth = { workspace = true }
 flanforge-core = { workspace = true }
 flanforge-manager = { workspace = true }
+flanforge-orm = { workspace = true }
+flanforge-webui-auth = { workspace = true }
+flanforge-wire = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 validator = { workspace = true }
 
 [dev-dependencies]
+flanforge-test-support = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]

@@ -46,11 +46,13 @@ jobs:
             '{profile: $profile, repository: $repository, run_id: $run_id, run_attempt: $run_attempt}')"
 
           # Returns once the guest is booted and its runner is registered, so
-          # this call blocks for the profile's boot budget.
-          allocation="$(curl -fsS -X POST "${FLANFORGED_URL}/v1/allocations" \
+          # this call blocks for the profile's boot budget. --fail-with-body
+          # keeps the daemon's JSON error so a failure names its reason here.
+          allocation="$(curl -sS --fail-with-body -X POST "${FLANFORGED_URL}/v1/allocations" \
             -H "Authorization: Bearer ${identity}" \
             -H 'Content-Type: application/json' \
-            -d "${body}")"
+            -d "${body}")" \
+            || { echo "allocation failed: ${allocation}" >&2; exit 1; }
 
           label="$(printf '%s' "${allocation}" | jq -r '.runner_label')"
           id="$(printf '%s' "${allocation}" | jq -r '.id')"

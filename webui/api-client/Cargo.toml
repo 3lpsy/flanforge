@@ -1,0 +1,32 @@
+# wasm32 only (hence not in default-members). Same-origin fetch and SSE over
+# web_sys; cookies ride along by default and every mutation carries the CSRF
+# header.
+[package]
+name = "flanforge-webui-api-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+flanforge-wire = { workspace = true }
+js-sys = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+
+[dependencies.web-sys]
+workspace = true
+features = [
+  "EventSource",
+  "Headers",
+  "MessageEvent",
+  "Request",
+  "RequestInit",
+  "Response",
+  "Window",
+]
+
+[lints]
+workspace = true

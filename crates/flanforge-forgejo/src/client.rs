@@ -11,6 +11,13 @@ use super::models::{
     ensure_success,
 };
 
+/// The page size asked of Forgejo. The server clamps it to its own
+/// `MaxResponseItems`, so what a page actually holds is never assumed.
+const RUNNER_PAGE_LIMIT: &str = "100";
+
+/// The most runner pages one name-based reconciliation reads.
+const RUNNER_PAGE_BUDGET: u32 = 10;
+
 #[derive(Clone)]
 pub struct ForgejoClient {
     pub(super) config: Arc<ForgejoConfig>,
@@ -140,6 +147,7 @@ impl ForgejoClient {
     /// # Errors
     ///
     /// Returns an error when listing is incomplete or Forgejo rejects cleanup.
+    /// An incomplete listing still deletes the matches it did find.
     pub async fn delete_runners_named(
         &self,
         repository: &RepositoryName,
@@ -147,22 +155,15 @@ impl ForgejoClient {
     ) -> Result<(), ForgejoError> {
         tracing::debug!(%repository, "reconciling Forgejo runners by deterministic name");
         let mut matching_ids = Vec::new();
-        for page in 1..=10 {
-            let mut url = self.runner_url(repository, None)?;
-            url.query_pairs_mut()
-                .append_pair("visible", "false")
-                .append_pair("limit", "100")
-                .append_pair("page", &page.to_string());
-            let response = self
-                .client
-                .get(url)
-                .bearer_auth(&self.token.0)
-                .send()
-                .await
-                .map_err(|_| ForgejoError::Unavailable)?;
-            let response = ensure_success(response)?;
-            let runners: ForgejoList<RunnerRecord> = bounded_json(response).await?;
-            let runners = runners.into_inner();
+        let mut is_listing_complete = false;
+        for page in 1..=RUNNER_PAGE_BUDGET {
+            let runners = self.runner_page(repository, page).await?;
+            // Forgejo clamps the requested size to its own maximum, so only an
+            // empty page proves the listing ended.
+            if runners.is_empty() {
+                is_listing_complete = true;
+                break;
+            }
             for runner in &runners {
                 if runner.name != name {
                     continue;
@@ -173,16 +174,41 @@ impl ForgejoClient {
                 })?;
                 matching_ids.push(runner.id);
             }
-            if runners.len() < 100 {
-                for runner_id in matching_ids {
-                    self.delete_runner(repository, runner_id).await?;
-                }
-                tracing::debug!(%repository, "deterministic runner reconciliation completed");
-                return Ok(());
-            }
         }
-        // A listing this long is not one this client can act on safely.
+        for runner_id in matching_ids {
+            self.delete_runner(repository, runner_id).await?;
+        }
+        if is_listing_complete {
+            tracing::debug!(%repository, "deterministic runner reconciliation completed");
+            return Ok(());
+        }
+        // A listing this long is not one this client can read to the end, so
+        // reconciliation stays incomplete even though its matches were deleted.
+        tracing::warn!(%repository, pages = RUNNER_PAGE_BUDGET, "Forgejo runner listing exceeded the page budget");
         Err(ForgejoError::Malformed)
+    }
+
+    /// Reads one page of the repository's runners, hidden ones included.
+    async fn runner_page(
+        &self,
+        repository: &RepositoryName,
+        page: u32,
+    ) -> Result<Vec<RunnerRecord>, ForgejoError> {
+        let mut url = self.runner_url(repository, None)?;
+        url.query_pairs_mut()
+            .append_pair("visible", "false")
+            .append_pair("limit", RUNNER_PAGE_LIMIT)
+            .append_pair("page", &page.to_string());
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.token.0)
+            .send()
+            .await
+            .map_err(|_| ForgejoError::Unavailable)?;
+        let response = ensure_success(response)?;
+        let runners: ForgejoList<RunnerRecord> = bounded_json(response).await?;
+        Ok(runners.into_inner())
     }
 
     #[must_use]

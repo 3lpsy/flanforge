@@ -54,6 +54,26 @@ fn a_retention_reason_is_bounded_at_construction() {
 }
 
 #[test]
+fn retention_duration_is_optional_and_serialized_when_measured() {
+    let legacy = RetentionOutcome::new(
+        RetentionResult::Promoted,
+        RetentionPhase::Promote,
+        "warm image promoted",
+        Some(3),
+    );
+    assert_eq!(legacy.duration_ms, None);
+    assert!(
+        !serde_json::to_value(&legacy)
+            .unwrap_or_else(|error| unreachable!("encode: {error}"))
+            .as_object()
+            .is_some_and(|value| value.contains_key("duration_ms"))
+    );
+
+    let measured = legacy.with_duration(std::time::Duration::from_millis(42));
+    assert_eq!(measured.duration_ms, Some(42));
+}
+
+#[test]
 fn image_names_are_derived_from_one_declared_name() {
     let record = WarmImageRecord {
         profile: ProfileName::new("halogen").unwrap_or_else(|error| unreachable!("{error}")),

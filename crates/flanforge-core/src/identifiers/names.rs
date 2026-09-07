@@ -122,7 +122,14 @@ fn is_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
 }
 
-identifier!(ProfileName, "profile name", 1, 32, is_name_byte);
+/// Hyphens are admitted for the operator's naming taste, at a documented
+/// cost: the environment overlay cannot spell them, so a hyphenated profile
+/// is overridable only through TOML and `--set`.
+fn is_profile_byte(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+}
+
+identifier!(ProfileName, "profile name", 1, 32, is_profile_byte);
 identifier!(RunnerLabel, "runner label", 1, 64, is_name_byte);
 identifier!(VmName, "VM name", 1, 80, is_name_byte);
 identifier!(VmPrefix, "VM prefix", 3, 24, is_name_byte);

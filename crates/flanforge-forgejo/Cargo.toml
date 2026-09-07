@@ -18,6 +18,7 @@ validator = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+flanforge-test-support = { workspace = true }
 axum = { workspace = true }
 tempfile = "3"
 

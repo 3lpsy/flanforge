@@ -1,0 +1,155 @@
+[logging]
+level = "info"
+
+[server]
+listen = "127.0.0.1:9843"
+request_body_limit_bytes = 4096
+allocation_wait_seconds = 600
+shutdown_grace_seconds = 30
+
+# [db]
+# The daemon's SQLite database; defaults to flanforge.db beside this file.
+# Point it into the state dir if sidecar files are unwelcome under /etc.
+# db_path = "/var/lib/flanforge/flanforge.db"
+
+# [webui]
+# The web UI is served on server.listen; all keys default.
+# enabled = true
+# public_read_only = false
+
+# [webui.oidc]
+# Single sign-on for the web UI (unrelated to [oidc] below).
+# enabled = true
+# issuer = "https://idp.example.com"
+# client_id = "flanforge-webui"
+# client_secret_file = "/etc/flanforge/webui-oidc-secret"
+# redirect_url = "https://ci.example.com/api/v1/oidc/callback"
+
+[oidc]
+issuer = "https://git.example.com/api/actions"
+audience = "flanforged"
+jwks_url = "https://git.example.com/api/actions/.well-known/keys"
+jwks_cache_seconds = 300
+clock_skew_seconds = 30
+
+[forgejo]
+api_url = "https://git.example.com/api/v1/"
+api_token_file = "/etc/flanforge/api-token"
+http_timeout_seconds = 15
+
+[runtime]
+state_dir = "/var/lib/flanforge"
+ssh_path = "/usr/bin/ssh"
+scp_path = "/usr/bin/scp"
+vm_prefix = "ci-"
+max_running_vms = 1
+# Host slots the hot pool may hold, at most max_running_vms. 0 is the global
+# kill switch, whatever a profile asks for: it admits no new claim and drains
+# every machine the pool still holds.
+max_hot_vms = 0
+poll_seconds = 2
+reap_interval_hours = 168
+host_cpu_count = 8
+host_memory_mb = 32768
+host_storage_mb = 262144
+
+[runtime.backend]
+kind = "libvirt"
+# Local socket by default. A remote host is supported over an authenticated
+# transport, which is what lets the service run in a container or on a
+# different machine from the hypervisor:
+#   uri = "qemu+ssh://flanforge@virt-host.example/system"
+#   uri = "qemu+tls://virt-host.example:16514/system"
+# `qemu+tcp` carries libvirt's root-equivalent API in clear text and is
+# refused unless allow_insecure_transport is also set. A `?no_verify=1`
+# query is always refused.
+uri = "qemu:///system"
+allow_insecure_transport = false
+pool = "flanforge"
+network = "flanforge-ci"
+image_manifest_dir = "/var/lib/flanforge/libvirt/published-bases"
+qemu_img_path = "/usr/bin/qemu-img"
+virsh_path = "/usr/bin/virsh"
+min_storage_free_mb = 32768
+# One warm capture's whole budget. cleanup_timeout_seconds caps at 600s, which
+# is a clone budget rather than a qcow2-convert budget.
+warm_capture_timeout_seconds = 1800
+# Optional: scanned at startup for <name>.qcow2 + <name>.manifest.json pairs
+# (one versioned subdirectory level deep) and imported automatically, so
+# publishing a base is "drop the build output here and restart". A pair whose
+# name is already published with different content is refused unless
+# image_reimport = "supersede", which republishes the record and leaves the
+# superseded volume behind for the operator.
+# image_import_dir = "/var/lib/flanforge-images"
+# image_reimport = "refuse"
+
+[guest]
+# The QEMU guest agent drives the guest over virtio-serial, host-local to the
+# hypervisor, so the daemon needs no route to the guest and no SSH key. This is
+# the libvirt default. Set "ssh" to drive it over SSH instead, which then
+# requires [guest.ssh]. Over a qemu+tcp URI the default is "ssh" and "agent" is
+# refused: the registration token must not cross a clear-text transport.
+channel = "agent"
+# The account the base image provides. The job runs as it, Tailscale takes it
+# as --operator, and the agent — which executes as root — drops to it. The
+# published base records its own account and the daemon refuses a mismatch.
+runner_user = "runner"
+# The privileged automation account the base optionally bakes (a passwordless
+# sudoer the daemon drives for root-needing clone-identity generalization).
+# Cross-checked against the published base the same way as runner_user; a base
+# built without it fails only the work that needs it.
+privileged_user = "prunner"
+forgejo_runner_path = "/usr/local/bin/forgejo-runner"
+
+# Optional under channel = "agent". Present means: seed this key's public half
+# and leave sshd enabled, so an operator can still log in to debug. Absent
+# means a secret-free seed and sshd masked for the allocation's lifetime.
+# Required whenever channel = "ssh".
+# [guest.ssh]
+# identity_file = "/etc/flanforge/guest-ssh-key"
+# The privileged account is authorized with the same key unless this names its
+# own; either way the seed authorizes both accounts.
+# privileged_identity_file = "/etc/flanforge/guest-ssh-key"
+# connect_timeout_seconds = 5
+# Libvirt generates and pins a unique host key for every allocation.
+# verify_host_key = true
+
+[tailscale]
+# Supported on libvirt; the guest joins using /usr/bin/tailscale, which the
+# base image must provide. Off here because the daemon reaches guests over the
+# libvirt network by default.
+enabled = false
+extra_args = ""
+
+# Runner labels must be unique across profiles; repositories need not be, so a
+# repository can carry one profile per operation rather than one union policy.
+[profiles.linux]
+repository = "owner/linux-project"
+# Logical immutable base name published by the image import workflow.
+template = "flanforge-base"
+runner_label = "linux-libvirt-project"
+job_name = "linux-build"
+allowed_workflows = ["ci.yml"]
+allowed_events = ["push", "workflow_dispatch"]
+allowed_refs = ["refs/heads/main", "refs/tags/v*"]
+require_protected_ref = true
+network = "default"
+cpu_count = 4
+memory_mb = 8192
+storage_mb = 40960
+boot_timeout_seconds = 300
+idle_timeout_seconds = 600
+job_timeout_seconds = 7200
+cleanup_timeout_seconds = 120
+# Hot guests keep a machine running between allocations, which is faster and
+# a weaker boundary: the next job inherits whatever the last one left. Off
+# unless runtime.max_hot_vms is raised and a [profiles.<name>.hot] table sets
+# enabled = true. A workflow then asks for it per request with "hot": true,
+# a number of seconds, or "evict"; the profile decides whether that means
+# anything. See crates/flanforge-config/README.md for the table.
+reap = true
+# Warm images: declare both keys or neither. The pool must be directory-backed
+# and runtime.reap_interval_hours must be non-zero, because superseded
+# generations are retired on the sweep once nothing can be reading them.
+#   warm_template = "flanforge-linux-warm"
+#   regeneration_workflow = "regeneration-linux.yml"

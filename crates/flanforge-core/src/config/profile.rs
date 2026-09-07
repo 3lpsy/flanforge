@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use flanforge_utils::is_safe_git_ref;
+use flanforge_utils::{is_glob_match, is_safe_git_ref_pattern};
 
 use crate::{PREVIOUS_SUFFIX, RunnerLabel, VmName};
 
@@ -9,15 +9,15 @@ use super::{Config, ConfigError, Profile};
 /// Longest reserved suffix a warm image name must still leave room for.
 const RESERVED_SUFFIX_LEN: usize = PREVIOUS_SUFFIX.len();
 
+/// Names are unique because profiles are a map, and labels must be too: a job
+/// is selected by label alone. Repositories may repeat — one repository can
+/// carry several profiles, each authorized against its own policy.
 pub(super) fn ensure_profiles_valid(config: &Config) -> Result<(), ConfigError> {
-    let mut repositories = BTreeSet::new();
     let mut labels = BTreeSet::new();
     for (name, profile) in &config.profiles {
         ensure_profile(name.as_str(), profile, config.runtime.vm_prefix.as_str())?;
-        if !repositories.insert(profile.repository.clone())
-            || !labels.insert(profile.runner_label.clone())
-        {
-            return Err(ConfigError::DuplicateProfileBinding);
+        if !labels.insert(profile.runner_label.clone()) {
+            return Err(ConfigError::DuplicateRunnerLabel);
         }
     }
     Ok(())
@@ -42,14 +42,14 @@ fn ensure_profile(name: &str, profile: &Profile, vm_prefix: &str) -> Result<(), 
     }
     if profile.allowed_workflows.is_empty()
         || profile.allowed_events.is_empty()
-        || (profile.allowed_refs.is_empty() && profile.allowed_ref_prefixes.is_empty())
+        || profile.allowed_refs.is_empty()
     {
         return Err(invalid("authorization allowlists cannot be empty"));
     }
     if !profile
         .allowed_workflows
         .iter()
-        .all(|value| is_safe_workflow(value))
+        .all(|value| is_safe_workflow_pattern(value))
     {
         return Err(invalid("workflow allowlist contains an unsafe name"));
     }
@@ -62,6 +62,8 @@ fn ensure_profile(name: &str, profile: &Profile, vm_prefix: &str) -> Result<(), 
     {
         return Err(invalid("job name contains an unsafe value"));
     }
+    // Events take no wildcards. Forgejo's trigger set is closed and short, so a
+    // pattern buys nothing and would reach `pull_request_target` by accident.
     if !profile.allowed_events.iter().all(|value| {
         !value.is_empty()
             && value.len() <= 64
@@ -74,13 +76,17 @@ fn ensure_profile(name: &str, profile: &Profile, vm_prefix: &str) -> Result<(), 
     if !profile
         .allowed_refs
         .iter()
-        .chain(&profile.allowed_ref_prefixes)
-        .all(|value| is_safe_git_ref(value))
+        .all(|value| is_safe_git_ref_pattern(value))
     {
         return Err(invalid("ref allowlist contains an unsafe value"));
     }
-    if !(1..=64).contains(&profile.cpu_count) || !(2_048..=131_072).contains(&profile.memory_mb) {
-        return Err(invalid("CPU or memory is outside the allowed range"));
+    if !(1..=64).contains(&profile.cpu_count)
+        || !(2_048..=131_072).contains(&profile.memory_mb)
+        || !(16_384..=1_048_576).contains(&profile.storage_mb)
+    {
+        return Err(invalid(
+            "CPU, memory, or storage is outside the allowed range",
+        ));
     }
     for (label, timeout, max) in [
         ("boot", profile.boot_timeout_seconds, 1_800),
@@ -114,8 +120,14 @@ fn warm_rules(profile: &Profile, vm_prefix: &str) -> Result<(), &'static str> {
             return Err("warm_template cannot be the profile template");
         }
     }
+    // It names one real file, so it must not itself be a pattern — but it has
+    // to satisfy the allowlist's patterns rather than appear in them verbatim.
     if let Some(workflow) = &profile.regeneration_workflow
-        && (!is_safe_workflow(workflow) || !profile.allowed_workflows.contains(workflow))
+        && (!is_safe_workflow(workflow)
+            || !profile
+                .allowed_workflows
+                .iter()
+                .any(|pattern| is_glob_match(pattern, workflow)))
     {
         return Err("regeneration_workflow must be an allowed workflow");
     }
@@ -123,10 +135,21 @@ fn warm_rules(profile: &Profile, vm_prefix: &str) -> Result<(), &'static str> {
 }
 
 fn is_safe_workflow(value: &str) -> bool {
+    is_safe_workflow_shape(value, false)
+}
+
+/// The allowlist holds patterns; `regeneration_workflow` names one real file.
+fn is_safe_workflow_pattern(value: &str) -> bool {
+    is_safe_workflow_shape(value, true)
+}
+
+fn is_safe_workflow_shape(value: &str, wildcards: bool) -> bool {
     !value.is_empty()
         && !value.contains('/')
         && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.')
+                || (wildcards && matches!(byte, b'*' | b'?'))
+        })
 }

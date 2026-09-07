@@ -1,0 +1,169 @@
+// chilled-proxy Gradle init script. Vendored verbatim from the proxy's own
+// examples/gradle/ — re-copy it when the proxy adds a mount, don't fork it.
+//
+// Gradle never reads the <mirrors> section of ~/.m2/settings.xml, so the Maven
+// client configuration has no effect on a Gradle build. Drop this file into
+// ~/.gradle/init.d/ (or pass it with -I) to route Gradle's Maven-layout
+// repositories through a chilled-proxy mount instead.
+//
+// A Gradle build resolves from three Maven-layout repositories, and a mount
+// serves exactly one upstream. A default `chilled-proxy` run mounts all three,
+// so one variable is enough:
+//
+//   export CHILLED_PROXY_URL=http://proxy.example.com:3080
+//
+//   Maven Central        -> $CHILLED_PROXY_URL/maven
+//   Gradle Plugin Portal -> $CHILLED_PROXY_URL/gradle-plugins
+//   Google Maven         -> $CHILLED_PROXY_URL/google-maven
+//
+// Override any one of them — to name a non-default mount path, or to leave an
+// upstream direct — with its own variable:
+//
+//   CHILLED_MAVEN_URL          Maven Central        (repo.maven.apache.org, repo1.maven.org)
+//   CHILLED_MAVEN_PLUGINS_URL  Gradle Plugin Portal (plugins.gradle.org/m2)
+//   CHILLED_MAVEN_GOOGLE_URL   Google Maven         (dl.google.com/dl/android/maven2)
+//
+// An upstream with neither a base URL nor its own variable keeps pointing at the
+// real host and is NOT age-gated. Every variable also reads a system property
+// (chilled.proxy.url, chilled.maven.url, .plugins.url, .google.url), so it can
+// live in gradle.properties as systemProp.chilled.proxy.url.
+//
+// Repository URLs are rewritten in place: nothing is added to or removed from a
+// project's repository list, so a build using RepositoriesMode.FAIL_ON_PROJECT_REPOS
+// keeps working. The one exception is an empty pluginManagement block, where the
+// portal default is implicit and has to be materialized — that is a settings-level
+// repository, which the mode does not govern.
+//
+// Covered: the settings buildscript, pluginManagement, dependencyResolutionManagement,
+// and every project's buildscript and repositories. The settings-level containers are
+// hooked from beforeSettings, because a settings `plugins { }` block and a settings
+// `buildscript { }` classpath resolve during settings evaluation — settingsEvaluated
+// runs after they have already fetched.
+//
+// Run with --info to see what was rewritten and what was left ungated.
+
+import org.gradle.api.artifacts.repositories.MavenArtifactRepository
+
+// Upstreams this script knows how to redirect, each with the chilled-proxy mount
+// that serves it by default.
+def MIRRORS = [
+    [
+        label   : 'Maven Central',
+        prefixes: ['https://repo.maven.apache.org/maven2', 'https://repo1.maven.org/maven2'],
+        property: 'chilled.maven.url',
+        env     : 'CHILLED_MAVEN_URL',
+        mount   : 'maven',
+    ],
+    [
+        label   : 'Gradle Plugin Portal',
+        prefixes: ['https://plugins.gradle.org/m2'],
+        property: 'chilled.maven.plugins.url',
+        env     : 'CHILLED_MAVEN_PLUGINS_URL',
+        mount   : 'gradle-plugins',
+    ],
+    [
+        label   : 'Google Maven',
+        prefixes: ['https://dl.google.com/dl/android/maven2', 'https://maven.google.com'],
+        property: 'chilled.maven.google.url',
+        env     : 'CHILLED_MAVEN_GOOGLE_URL',
+        mount   : 'google-maven',
+    ],
+]
+
+// Compares repository URLs without tripping over case or a trailing slash.
+def normalize = { String url -> url.toLowerCase().replaceAll('/+$', '') }
+
+/// A system property, else the environment variable, else null.
+def setting = { String property, String env ->
+    def value = System.getProperty(property) ?: System.getenv(env)
+    value?.trim() ?: null
+}
+
+def base = setting('chilled.proxy.url', 'CHILLED_PROXY_URL')?.replaceAll('/+$', '')
+def configured = MIRRORS.collect { mirror ->
+    // An upstream's own variable wins over the proxy's default mount for it.
+    def url = setting(mirror.property, mirror.env) ?: (base ? "$base/$mirror.mount" : null)
+    url ? mirror + [url: url] : null
+}.findAll()
+
+if (configured.isEmpty()) {
+    logger.warn('chilled: no proxy configured (CHILLED_PROXY_URL is unset) — repositories are ' +
+                'left untouched and nothing is age-gated')
+    return
+}
+
+// The mount replacing `url`, or null when that upstream has no mount configured.
+def mirrorFor = { String url ->
+    def target = normalize(url)
+    configured.find { mirror -> mirror.prefixes.any { target.startsWith(normalize(it)) } }?.url
+}
+
+// Repoints every mapped repository in `repos`. Uses the live `all` hook so
+// repositories declared later in the build are caught too.
+def rewrite = { repos, String where ->
+    repos.all { repo ->
+        if (!(repo instanceof MavenArtifactRepository)) {
+            return
+        }
+        def current = repo.url?.toString()
+        if (!current) {
+            return
+        }
+        def replacement = mirrorFor(current)
+        if (!replacement) {
+            // file: URLs (mavenLocal) and unmapped hosts land here. A repository
+            // already pointing at one of our mounts is gated, not ungated.
+            def alreadyMounted = configured.any { normalize(current).startsWith(normalize(it.url)) }
+            if (!alreadyMounted && current.toLowerCase().startsWith('http')) {
+                logger.info("chilled: $where: ${repo.name} ($current) has no mount — left ungated")
+            }
+            return
+        }
+        if (normalize(current) == normalize(replacement)) {
+            return
+        }
+        repo.url = URI.create(replacement)
+        // Gradle 6+ refuses plaintext HTTP repositories unless asked to allow it.
+        if (replacement.toLowerCase().startsWith('http://') && repo.hasProperty('allowInsecureProtocol')) {
+            repo.allowInsecureProtocol = true
+        }
+        logger.info("chilled: $where: ${repo.name} -> $replacement")
+    }
+}
+
+// Before the settings script is evaluated, not after: a settings-level
+// `plugins { }` block and a settings `buildscript { }` classpath both resolve
+// *during* that evaluation, so a settingsEvaluated hook would run too late and
+// let them reach the real upstream ungated. The `all` hook is live, so
+// repositories the settings script declares later are still caught.
+gradle.beforeSettings { settings ->
+    rewrite(settings.buildscript.repositories, 'settings.buildscript')
+    rewrite(settings.pluginManagement.repositories, 'pluginManagement')
+    rewrite(settings.dependencyResolutionManagement.repositories, 'dependencyResolutionManagement')
+}
+
+gradle.settingsEvaluated { settings ->
+    def pluginRepos = settings.pluginManagement.repositories
+
+    // An empty pluginManagement block gets gradlePluginPortal() added after this
+    // hook runs, so there is nothing to rewrite — add the mount instead, which
+    // both suppresses that default and gates plugin resolution.
+    def portal = configured.find { it.label == 'Gradle Plugin Portal' }
+    if (portal && pluginRepos.isEmpty()) {
+        pluginRepos.maven { repo ->
+            repo.name = 'chilledGradlePluginPortal'
+            repo.url = URI.create(portal.url)
+            if (portal.url.toLowerCase().startsWith('http://') && repo.hasProperty('allowInsecureProtocol')) {
+                repo.allowInsecureProtocol = true
+            }
+        }
+        logger.info("chilled: pluginManagement: implicit portal -> ${portal.url}")
+    }
+}
+
+gradle.projectsLoaded {
+    gradle.rootProject.allprojects { project ->
+        rewrite(project.buildscript.repositories, "buildscript(${project.path})")
+        rewrite(project.repositories, "repositories(${project.path})")
+    }
+}

@@ -30,7 +30,11 @@ impl AllocationState {
         }
         match self {
             Self::Requested => matches!(next, Self::Preparing | Self::Cleaning),
-            Self::Preparing => matches!(next, Self::Booting | Self::Cleaning),
+            // `Registering` is the hot claim: the machine is already up, so
+            // there is nothing to boot. Adding the edge rather than a state is
+            // deliberate — allocation states are a wire contract the allocator
+            // job reads, and an unseen transition breaks nobody.
+            Self::Preparing => matches!(next, Self::Booting | Self::Registering | Self::Cleaning),
             Self::Booting => matches!(next, Self::Registering | Self::Cleaning),
             Self::Registering => matches!(next, Self::WaitingForJob | Self::Cleaning),
             Self::WaitingForJob => matches!(next, Self::Ready | Self::Running | Self::Cleaning),

@@ -15,9 +15,14 @@ pub(super) fn spawn_reaper(
         tracing::info!("reaper is disabled by configuration");
         return;
     }
-    if handle.current().runtime.tart_home.is_none() {
-        tracing::warn!(
-            "runtime.tart_home is unset, so no VM age can be determined and every sweep is inert"
+    if handle
+        .current()
+        .runtime
+        .tart()
+        .is_some_and(|tart| tart.home.is_none())
+    {
+        tracing::info!(
+            "runtime.backend.home is unset; the sweep ages VMs from the library Tart itself resolves"
         );
     }
     tokio::spawn(async move {

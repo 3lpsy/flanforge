@@ -9,6 +9,23 @@ request_body_limit_bytes = 4096
 allocation_wait_seconds = 600
 shutdown_grace_seconds = 30
 
+# [db]
+# The daemon's SQLite database; defaults to flanforge.db beside this file.
+# db_path = "~/Library/Application Support/flanforge/flanforge.db"
+
+# [webui]
+# The web UI is served on server.listen; all keys default.
+# enabled = true
+# public_read_only = false
+
+# [webui.oidc]
+# Single sign-on for the web UI (unrelated to [oidc] below).
+# enabled = true
+# issuer = "https://idp.example.com"
+# client_id = "flanforge-webui"
+# client_secret_file = "~/Library/Application Support/flanforge/webui-oidc-secret"
+# redirect_url = "https://ci.example.com/api/v1/oidc/callback"
+
 [oidc]
 issuer = "https://git.example.com/api/actions"
 audience = "flanforged"
@@ -23,30 +40,48 @@ http_timeout_seconds = 15
 
 [runtime]
 state_dir = "~/Library/Application Support/flanforge/state"
-tart_path = "/opt/homebrew/bin/tart"
 ssh_path = "/usr/bin/ssh"
 scp_path = "/usr/bin/scp"
-forgejo_runner_host_path = "~/Library/Application Support/flanforge/bin/forgejo-runner"
 # Explicit ownership boundary: exact allocation names below it may be deleted.
 vm_prefix = "ci-"
-# Tart's VM library. Required by warm templates and by the sweep, which ages a
-# VM from its directory and refuses to guess where that directory is.
-tart_home = "~/.tart"
 max_running_vms = 2
+# Host slots the hot pool may hold, at most max_running_vms. 0 is the global
+# kill switch, whatever a profile asks for: it admits no new claim and drains
+# every machine the pool still holds.
+max_hot_vms = 0
 poll_seconds = 2
-# Unreferenced clone and image sweep; 0 disables it. Needs tart_home above.
+# Unreferenced clone and image sweep; 0 disables it.
 reap_interval_hours = 168
 # Declare both to admit a second guest within what the host can afford.
 # host_cpu_count = 16
 # host_memory_mb = 32768
+# host_storage_mb = 262144
+
+[runtime.backend]
+kind = "tart"
+path = "/opt/homebrew/bin/tart"
+# Unset uses the runner the base image bakes at guest.forgejo_runner_path.
+# Set a host path to copy that binary into every guest instead.
+# runner_host_path = "~/Library/Application Support/flanforge/bin/forgejo-runner"
+# Tart's VM library. Required by warm templates. The sweep ages a VM from its
+# directory here, resolving `$TART_HOME` then `~/.tart` when this is unset.
+home = "~/.tart"
 
 [guest]
-ssh_user = "runner"
-ssh_identity_file = "~/Library/Application Support/flanforge/guest-ssh-key"
-ssh_known_hosts_file = "~/Library/Application Support/flanforge/known_hosts"
-ssh_host_key_alias = "flanforge-tart-guest"
+# Tart has no guest agent, so SSH is the only channel here. Written out so the
+# file answers which channel it is on without resolving defaults.
+channel = "ssh"
+# The account the base image provides. The job runs as it, Tailscale takes it
+# as --operator, and it is the SSH login.
+runner_user = "runner"
 forgejo_runner_path = "/Users/runner/bin/forgejo-runner"
-ssh_connect_timeout_seconds = 5
+
+# Required whenever channel = "ssh", which on Tart is always.
+[guest.ssh]
+identity_file = "~/Library/Application Support/flanforge/guest-ssh-key"
+known_hosts_file = "~/Library/Application Support/flanforge/known_hosts"
+host_key_alias = "flanforge-tart-guest"
+connect_timeout_seconds = 5
 # Set to false only for bring-up, before the template host key is recorded: the
 # two settings above are then unused and an on-path attacker between host and
 # guest can impersonate the guest. The daemon warns at every startup.
@@ -61,43 +96,37 @@ enabled = false
 # Parsed into arguments without shell evaluation.
 extra_args = ""
 
-[profiles.halogen]
-repository = "owner/halogen"
-template = "flanforge-base"
-runner_label = "macos-tart-halogen"
-job_name = "apple-build"
-allowed_workflows = ["apple.yml"]
-allowed_events = ["push", "workflow_dispatch"]
-allowed_refs = ["refs/heads/main"]
-allowed_ref_prefixes = ["refs/tags/v"]
-require_protected_ref = true
-network = "softnet"
-cpu_count = 4
-memory_mb = 8192
-boot_timeout_seconds = 300
-idle_timeout_seconds = 600
-job_timeout_seconds = 7200
-cleanup_timeout_seconds = 120
-# Opt into warm bases: the image consumers clone, and the only workflow that
-# may produce it. Both or neither; runtime.tart_home is then required.
-# warm_template = "halogen-warm"
-# regeneration_workflow = "warm.yml"
-reap = true
-
+# Runner labels must be unique across profiles. Repositories need not be: give
+# a repository one profile per operation — a protected-tag release and a cheap
+# pull-request check — instead of one profile that unions both policies.
 [profiles.liftfg]
 repository = "owner/liftfg"
 template = "flanforge-base"
 runner_label = "macos-tart-liftfg"
 job_name = "apple-build"
+# Workflow and ref allowlists are glob patterns: `*` matches any run of
+# characters, `?` exactly one, and an entry without either matches only itself.
+# Events are literal and take no wildcards.
 allowed_workflows = ["apple.yml"]
 allowed_events = ["push", "workflow_dispatch"]
-allowed_refs = ["refs/heads/main"]
-allowed_ref_prefixes = ["refs/tags/v"]
+allowed_refs = ["refs/heads/main", "refs/tags/v*"]
 require_protected_ref = true
 network = "softnet"
 cpu_count = 4
 memory_mb = 8192
+storage_mb = 40960
 boot_timeout_seconds = 300
 idle_timeout_seconds = 600
 job_timeout_seconds = 7200
 cleanup_timeout_seconds = 120
+# Opt into warm bases: the image consumers clone, and the only workflow that
+# may produce it. Both or neither; runtime.backend.home is then required.
+# warm_template = "liftfg-warm"
+# regeneration_workflow = "warm.yml"
+# Hot guests keep a machine running between allocations, which is faster and
+# a weaker boundary: the next job inherits whatever the last one left. Off
+# unless runtime.max_hot_vms is raised and a [profiles.<name>.hot] table sets
+# enabled = true. A workflow then asks for it per request with "hot": true,
+# a number of seconds, or "evict"; the profile decides whether that means
+# anything. See crates/flanforge-config/README.md for the table.
+reap = true

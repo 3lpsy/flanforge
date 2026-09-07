@@ -1,10 +1,14 @@
 mod model;
+mod origin;
+mod outcome;
 mod size;
 mod sizing;
 mod source;
 mod state;
 
 pub use model::{Allocation, AllocationId, AllocationRequest};
+pub use origin::AllocationOrigin;
+pub use outcome::TerminalReason;
 pub use size::GuestSize;
 pub use sizing::{RequestOptions, SizeCeilingError, resolve_mode, resolve_size};
 pub use source::{AllocationMode, CloneKind, CloneSource, FallbackReason};

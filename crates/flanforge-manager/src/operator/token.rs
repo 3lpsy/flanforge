@@ -62,7 +62,31 @@ pub fn is_token_match(presented: &str, expected: &str) -> bool {
         == 0
 }
 
+/// This credential is the whole operator surface — cancel and reap — so a
+/// copy restored with a loose mode must not be honoured. `mode(0o600)` on
+/// write only covers files this process created.
 async fn read_token(path: &Path) -> std::io::Result<Option<String>> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "operator credential is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "operator credential is readable beyond its owner",
+            ));
+        }
+    }
     match tokio::fs::read_to_string(path).await {
         Ok(text) => Ok(Some(text.trim().to_owned()).filter(|token| !token.is_empty())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),

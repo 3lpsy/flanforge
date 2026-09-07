@@ -7,11 +7,18 @@ publish = false
 
 [dependencies]
 axum = { workspace = true }
+flanforge-extractors = { workspace = true }
+flanforge-handlers = { workspace = true }
+flanforge-webui-routes = { workspace = true }
 flanforge-routes = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+flanforge-config = { workspace = true }
+flanforge-webui-auth = { workspace = true }
+flanforge-migrations = { workspace = true }
+flanforge-orm = { workspace = true }
 async-trait = { workspace = true }
 flanforge-auth = { workspace = true }
 flanforge-core = { workspace = true }

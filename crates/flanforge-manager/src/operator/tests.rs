@@ -2,19 +2,29 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use flanforge_core::{
-    Allocation, AllocationId, AllocationMode, AllocationState, Config, Profile, RequestOptions,
-    RunnerLabel, VmName,
+    Allocation, AllocationId, AllocationMode, AllocationState, CloneKind, CloneSource, Config,
+    HotGuest, HotLane, HotState, Profile, RequestOptions, RunnerLabel, VmName,
 };
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use flanforge_store::{AllocationStore, JsonStateStore, JsonWarmImageStore, StoreError};
+use flanforge_store::{AllocationStore, HotGuestStore, StoreError, WarmImageStore};
 use flanforge_test_support as test_support;
 
 use super::super::{
-    AllocationManager, AllocationReporter, AllocationWorker, BusyReason, ConfigHandle,
-    ManagerError, WorkerError,
+    AllocationManager, AllocationReporter, AllocationWorker, BusyReason, CleanupBudget,
+    ConfigHandle, ManagerError, WorkerError,
 };
+use super::status::bounded_count;
+
+use crate::tests::UnavailableWarmImageStore;
+use flanforge_orm::{SqliteAllocationStore, SqliteHotGuestStore, SqliteWarmImageStore};
+
+#[test]
+fn wire_counts_saturate_at_the_contract_bound() {
+    assert_eq!(bounded_count(12), 12);
+    assert_eq!(bounded_count(usize::MAX), 65_535);
+}
 
 /// Parks in `waiting_for_job`, exactly like a workflow whose dependent job was
 /// cancelled before it queued.
@@ -50,7 +60,11 @@ impl AllocationWorker for ParkedWorker {
         Err(WorkerError::new("cancelled"))
     }
 
-    async fn cleanup(&self, _allocation: Allocation, _profile: Profile) -> Result<(), WorkerError> {
+    async fn cleanup(
+        &self,
+        _allocation: Allocation,
+        _budget: CleanupBudget,
+    ) -> Result<(), WorkerError> {
         if let Some(cleanups) = &self.cleanups {
             cleanups.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
@@ -58,6 +72,34 @@ impl AllocationWorker for ParkedWorker {
             let _permit = gate.acquire().await;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct UnavailableHostWorker;
+
+#[async_trait]
+impl AllocationWorker for UnavailableHostWorker {
+    async fn run(
+        &self,
+        _allocation: Allocation,
+        _profile: Profile,
+        _reporter: AllocationReporter,
+        _cancellation: CancellationToken,
+    ) -> Result<(), WorkerError> {
+        Ok(())
+    }
+
+    async fn cleanup(
+        &self,
+        _allocation: Allocation,
+        _budget: CleanupBudget,
+    ) -> Result<(), WorkerError> {
+        Ok(())
+    }
+
+    async fn machines(&self) -> Result<Vec<super::super::HostMachine>, WorkerError> {
+        Err(WorkerError::new("host inventory unavailable"))
     }
 }
 
@@ -85,7 +127,7 @@ impl AllocationStore for FailingStore {
 
 async fn store(directory: &std::path::Path) -> Arc<dyn AllocationStore> {
     Arc::new(
-        JsonStateStore::open(directory)
+        SqliteAllocationStore::open(&directory.join("state.db"))
             .await
             .unwrap_or_else(|error| unreachable!("fixture: {error}")),
     )
@@ -97,14 +139,35 @@ async fn manager_over(
     directory: &std::path::Path,
     store: Arc<dyn AllocationStore>,
     config: Arc<Config>,
-    worker: ParkedWorker,
+    worker: impl AllocationWorker + 'static,
 ) -> AllocationManager {
     let images = Arc::new(
-        JsonWarmImageStore::open(directory)
+        SqliteWarmImageStore::open(&directory.join("state.db"))
             .await
             .unwrap_or_else(|error| unreachable!("fixture: {error}")),
     );
-    AllocationManager::new(ConfigHandle::new(config), store, images, Arc::new(worker))
+    manager_over_images(directory, store, config, worker, images).await
+}
+
+async fn manager_over_images(
+    directory: &std::path::Path,
+    store: Arc<dyn AllocationStore>,
+    config: Arc<Config>,
+    worker: impl AllocationWorker + 'static,
+    images: Arc<dyn WarmImageStore>,
+) -> AllocationManager {
+    let hot: Arc<dyn HotGuestStore> = Arc::new(
+        SqliteHotGuestStore::open(&directory.join("state.db"))
+            .await
+            .unwrap_or_else(|error| unreachable!("fixture: {error}")),
+    );
+    AllocationManager::new(
+        ConfigHandle::new(config),
+        store,
+        images,
+        hot,
+        Arc::new(worker),
+    )
 }
 
 fn budgeted(state_dir: std::path::PathBuf) -> Arc<Config> {
@@ -126,6 +189,48 @@ async fn await_terminal(manager: &AllocationManager, id: AllocationId) -> Alloca
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     unreachable!("allocation did not reach a terminal state");
+}
+
+async fn await_cleanup_count(cleanups: &std::sync::atomic::AtomicUsize, expected: usize) {
+    for _ in 0..500 {
+        if cleanups.load(std::sync::atomic::Ordering::Acquire) == expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    unreachable!("cleanup count did not reach {expected}");
+}
+
+async fn await_receiver_count(manager: &AllocationManager, id: AllocationId, expected: usize) {
+    for _ in 0..500 {
+        let receivers = manager
+            .inner
+            .entries
+            .lock()
+            .await
+            .get(&id)
+            .map(|entry| entry.sender.receiver_count())
+            .unwrap_or_default();
+        if receivers == expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    unreachable!("receiver count did not reach {expected}");
+}
+
+async fn await_shutdown_start(manager: &AllocationManager) {
+    for _ in 0..500 {
+        if manager
+            .inner
+            .is_closing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    unreachable!("shutdown did not start");
 }
 
 #[tokio::test]
@@ -234,6 +339,136 @@ async fn an_unknown_id_is_not_found() {
         manager.cancel_by_id(AllocationId::new()).await,
         Err(ManagerError::NotFound(_))
     ));
+}
+
+#[tokio::test]
+async fn status_reports_when_warm_image_authority_is_unavailable() {
+    let directory = tempfile::tempdir().unwrap_or_else(|error| unreachable!("fixture: {error}"));
+    let manager = manager_over_images(
+        directory.path(),
+        store(directory.path()).await,
+        test_support::config(directory.path().to_path_buf()),
+        ParkedWorker::default(),
+        Arc::new(UnavailableWarmImageStore),
+    )
+    .await;
+
+    let status = manager.status_snapshot().await;
+    assert!(!status.is_warm_image_store_visible);
+    assert!(status.warm_images.is_empty());
+}
+
+/// RUN-745: the pool holds a slot continuously, and an operator must be able
+/// to see that rather than read one active allocation against two slots and
+/// conclude there is room.
+#[tokio::test]
+async fn status_reports_the_slot_an_idle_hot_guest_holds() {
+    let directory = tempfile::tempdir().unwrap_or_else(|error| unreachable!("fixture: {error}"));
+    let name = "ci-project-9-1";
+    let hot: Arc<dyn HotGuestStore> = Arc::new(
+        SqliteHotGuestStore::open(&directory.path().join("state.db"))
+            .await
+            .unwrap_or_else(|error| unreachable!("fixture: {error}")),
+    );
+    let mut guest = HotGuest::new(
+        VmName::new(name).unwrap_or_else(|error| unreachable!("fixture: {error}")),
+        test_support::profile_name(),
+        HotLane::Protected,
+        test_support::size(),
+        CloneSource {
+            name: VmName::new("flanforge-base")
+                .unwrap_or_else(|error| unreachable!("fixture: {error}")),
+            kind: CloneKind::Template,
+            base_fingerprint: None,
+            fallback_reason: None,
+        },
+        None,
+        None,
+    );
+    guest.state = HotState::Idle;
+    hot.save(&guest)
+        .await
+        .unwrap_or_else(|error| unreachable!("fixture: {error}"));
+
+    let mut config = (*test_support::hot_config(directory.path().to_path_buf())).clone();
+    config.runtime.max_running_vms = 2;
+    let manager = AllocationManager::new(
+        ConfigHandle::new(Arc::new(config)),
+        store(directory.path()).await,
+        Arc::new(
+            SqliteWarmImageStore::open(&directory.path().join("state.db"))
+                .await
+                .unwrap_or_else(|error| unreachable!("fixture: {error}")),
+        ),
+        Arc::clone(&hot),
+        Arc::new(PooledHostWorker(name.to_owned())),
+    );
+
+    let capacity = manager.status_snapshot().await.capacity;
+    assert_eq!(capacity.hot_running, 1, "the pool's slot is reported");
+    assert_eq!(capacity.max_hot_vms, 1);
+    assert_eq!(capacity.max_running_vms, 2);
+    // Not foreign: classifying it that way is what the record exists to stop.
+    assert_eq!(capacity.foreign_running, 0);
+    assert_eq!(capacity.active_allocations, 0);
+
+    // And the same record is one row of the listing the operator can ask for.
+    let listed = manager.hot_list().await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].vm_name.as_str(), name);
+    assert_eq!(listed[0].state, HotState::Idle);
+    assert!(listed[0].is_machine_present);
+}
+
+/// A host reporting exactly one machine, the pool's, owned by this service.
+#[derive(Debug)]
+struct PooledHostWorker(String);
+
+#[async_trait]
+impl AllocationWorker for PooledHostWorker {
+    async fn run(
+        &self,
+        _allocation: Allocation,
+        _profile: Profile,
+        _reporter: AllocationReporter,
+        _cancellation: CancellationToken,
+    ) -> Result<(), WorkerError> {
+        Ok(())
+    }
+
+    async fn cleanup(
+        &self,
+        _allocation: Allocation,
+        _budget: CleanupBudget,
+    ) -> Result<(), WorkerError> {
+        Ok(())
+    }
+
+    async fn machines(&self) -> Result<Vec<super::super::HostMachine>, WorkerError> {
+        Ok(vec![super::super::HostMachine {
+            name: self.0.clone(),
+            state: super::super::MachineState::Running,
+            age_seconds: Some(60),
+            size: None,
+            ownership: super::super::MachineOwnership::Owned,
+        }])
+    }
+}
+
+#[tokio::test]
+async fn status_reports_when_host_inventory_is_unavailable() {
+    let directory = tempfile::tempdir().unwrap_or_else(|error| unreachable!("fixture: {error}"));
+    let manager = manager_over(
+        directory.path(),
+        store(directory.path()).await,
+        test_support::config(directory.path().to_path_buf()),
+        UnavailableHostWorker,
+    )
+    .await;
+
+    let status = manager.status_snapshot().await;
+    assert!(!status.capacity.is_host_visible);
+    assert!(status.is_warm_image_store_visible);
 }
 
 #[tokio::test]
@@ -383,9 +618,10 @@ async fn cancelling_an_entry_whose_worker_gave_up_reaches_terminal_and_frees_cap
     );
 }
 
-/// RUN-582: two overlapping operator cancels run one cleanup and answer alike.
+/// RUN-384/RUN-582: the authorized path drives one ownerless cleanup and
+/// concurrent callers receive the same terminal answer.
 #[tokio::test]
-async fn two_overlapping_cancels_clean_up_once() {
+async fn two_overlapping_authorized_cancels_clean_up_once() {
     let directory = tempfile::tempdir().unwrap_or_else(|error| unreachable!("fixture: {error}"));
     let store = store(directory.path()).await;
     let mut interrupted = Allocation::new(
@@ -418,21 +654,41 @@ async fn two_overlapping_cancels_clean_up_once() {
         .await
         .unwrap_or_else(|error| unreachable!("load: {error}"));
 
+    let mut unauthorized = test_support::claims();
+    unauthorized.repository = "owner/other".into();
+    assert!(matches!(
+        manager
+            .cancel_authorized(interrupted.id, &unauthorized)
+            .await,
+        Err(ManagerError::Authorization(_))
+    ));
+    assert_eq!(cleanups.load(std::sync::atomic::Ordering::Acquire), 0);
+
     let first = tokio::spawn({
         let manager = manager.clone();
-        async move { manager.cancel_by_id(interrupted.id).await }
+        async move {
+            manager
+                .cancel_authorized(interrupted.id, &test_support::claims())
+                .await
+        }
     });
     // Let the first call take ownership before the second arrives.
-    for _ in 0..500 {
-        if cleanups.load(std::sync::atomic::Ordering::Acquire) == 1 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    await_cleanup_count(&cleanups, 1).await;
     let second = tokio::spawn({
         let manager = manager.clone();
-        async move { manager.cancel_by_id(interrupted.id).await }
+        async move {
+            manager
+                .cancel_authorized(interrupted.id, &test_support::claims())
+                .await
+        }
     });
+    await_receiver_count(&manager, interrupted.id, 1).await;
+    let shutdown = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.shutdown(std::time::Duration::from_secs(30)).await }
+    });
+    await_shutdown_start(&manager).await;
+    assert!(!shutdown.is_finished());
     gate.add_permits(2);
 
     let first = first
@@ -447,4 +703,17 @@ async fn two_overlapping_cancels_clean_up_once() {
     assert_eq!(second.state, AllocationState::Cancelled);
     assert_eq!(cleanups.load(std::sync::atomic::Ordering::Acquire), 1);
     assert_eq!(first.error, None);
+    assert!(
+        shutdown
+            .await
+            .unwrap_or_else(|error| unreachable!("join: {error}"))
+            .is_clean()
+    );
+
+    let repeated = manager
+        .cancel_authorized(interrupted.id, &test_support::claims())
+        .await
+        .unwrap_or_else(|error| unreachable!("repeat cancel: {error}"));
+    assert_eq!(repeated.state, AllocationState::Cancelled);
+    assert_eq!(cleanups.load(std::sync::atomic::Ordering::Acquire), 1);
 }

@@ -9,7 +9,9 @@ publish = false
 async-trait = { workspace = true }
 flanforge-core = { workspace = true }
 flanforge-store = { workspace = true }
+flanforge-wire = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
@@ -18,8 +20,8 @@ uuid = { workspace = true }
 validator = { workspace = true }
 
 [dev-dependencies]
+flanforge-orm = { workspace = true }
 flanforge-test-support = { workspace = true }
-serde_json = { workspace = true }
 tempfile = "3"
 
 [lints]

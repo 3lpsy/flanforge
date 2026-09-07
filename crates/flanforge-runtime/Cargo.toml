@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+test-support = []
+
 [dependencies]
 async-trait = { workspace = true }
 flanforge-core = { workspace = true }
@@ -20,11 +23,8 @@ validator = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-axum = { workspace = true }
-flanforge-store = { workspace = true }
 flanforge-test-support = { workspace = true }
 tempfile = "3"
-tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

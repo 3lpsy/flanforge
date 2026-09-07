@@ -1,4 +1,6 @@
-use flanforge_core::{Allocation, VmName, WarmGeneration, WarmImageRecord, WarmImageState};
+use flanforge_core::{
+    Allocation, ProfileName, VmName, WarmGeneration, WarmImageRecord, WarmImageState,
+};
 
 use super::super::{AllocationManager, ManagerError};
 
@@ -22,6 +24,42 @@ impl AllocationManager {
         self.inner.images.save(&record).await?;
         Ok(())
     }
+
+    /// Rewrites a profile's warm record as the generation that survives an
+    /// abandoned promotion, or drops it when none does.
+    ///
+    /// A record left describing a candidate that was never promoted costs
+    /// every later allocation a cold boot, so both the backend rollback and
+    /// startup recovery come through here.
+    ///
+    /// # Errors
+    /// Returns an error when the record cannot be written or removed.
+    pub(crate) async fn ensure_warm_reverted(
+        &self,
+        profile: &ProfileName,
+        warm_template: &VmName,
+        previous: Option<&WarmGeneration>,
+    ) -> Result<(), ManagerError> {
+        match previous {
+            Some(previous) => {
+                self.inner
+                    .images
+                    .save(&WarmImageRecord {
+                        profile: profile.clone(),
+                        warm_template: warm_template.clone(),
+                        generation: previous.generation,
+                        base_fingerprint: previous.base_fingerprint.clone(),
+                        produced_by: previous.produced_by,
+                        produced_at_unix: previous.produced_at_unix,
+                        state: WarmImageState::Promoted,
+                        previous: None,
+                    })
+                    .await?;
+            }
+            None => self.inner.images.remove(profile).await?,
+        }
+        Ok(())
+    }
 }
 
 /// Re-reads production authority at retention time: the profile must still
@@ -30,15 +68,21 @@ impl AllocationManager {
 pub(crate) async fn retention_plan(
     manager: &AllocationManager,
     allocation: &Allocation,
-) -> Option<RetentionPlan> {
+) -> Result<Option<RetentionPlan>, ManagerError> {
     if !allocation.is_retention_eligible() {
-        return None;
+        return Ok(None);
     }
     let config = manager.inner.config.current();
     let name = &allocation.request.profile;
-    let profile = config.profiles.get(name)?;
-    let warm = profile.warm_template.as_ref()?;
-    profile.regeneration_workflow.as_ref()?;
+    let Some(profile) = config.profiles.get(name) else {
+        return Ok(None);
+    };
+    let Some(warm) = profile.warm_template.as_ref() else {
+        return Ok(None);
+    };
+    if profile.regeneration_workflow.is_none() {
+        return Ok(None);
+    }
     // Lineage stays one generation deep: only a clone of the trusted base may
     // become the next image.
     if allocation
@@ -47,14 +91,21 @@ pub(crate) async fn retention_plan(
         .is_none_or(|source| source.name != profile.template)
     {
         tracing::warn!(allocation_id = %allocation.id, "retention refused: the guest was not cloned from the profile template");
-        return None;
+        return Ok(None);
     }
-    let record = manager.inner.images.load(name).await.ok().flatten();
-    if record.is_none() && is_present(manager, warm).await {
+    let record = manager.inner.images.load(name).await?;
+    let listing = manager.host_machines().await?;
+    if record.is_none()
+        && manager
+            .inner
+            .worker
+            .is_unclaimed_image(warm, &listing)
+            .await?
+    {
         tracing::error!(allocation_id = %allocation.id, warm_template = %warm, "retention refused: the warm name is an unclaimed pre-existing VM");
-        return None;
+        return Ok(None);
     }
-    Some(RetentionPlan {
+    Ok(Some(RetentionPlan {
         warm_template: warm.clone(),
         generation: record.as_ref().map_or(1, |record| record.generation + 1),
         previous: record.map(|record| WarmGeneration {
@@ -63,16 +114,5 @@ pub(crate) async fn retention_plan(
             produced_by: record.produced_by,
             produced_at_unix: record.produced_at_unix,
         }),
-    })
-}
-
-async fn is_present(manager: &AllocationManager, name: &VmName) -> bool {
-    manager
-        .inner
-        .worker
-        .machines()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .any(|machine| machine.name == name.as_str())
+    }))
 }

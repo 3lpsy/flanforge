@@ -1,0 +1,17 @@
+[package]
+name = "flanforge-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+flanforge-config = { workspace = true }
+flanforge-core = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

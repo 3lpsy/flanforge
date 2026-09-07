@@ -52,12 +52,27 @@ impl TailscaleConfig {
                     || argument
                         .bytes()
                         .any(|byte| byte == 0 || byte.is_ascii_control())
+                    || is_reserved_argument(argument)
             })
         {
             return Err(ConfigError::InvalidTailscaleArguments);
         }
         Ok(arguments)
     }
+}
+
+fn is_reserved_argument(argument: &str) -> bool {
+    let Some(option) = argument
+        .strip_prefix("--")
+        .or_else(|| argument.strip_prefix('-'))
+    else {
+        return false;
+    };
+    let name = option.split_once('=').map_or(option, |(name, _)| name);
+    matches!(
+        name,
+        "auth-key" | "authkey" | "login-server" | "operator" | "hostname"
+    )
 }
 
 fn ensure_hostname(value: &str) -> Result<(), ConfigError> {

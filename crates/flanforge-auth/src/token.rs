@@ -1,7 +1,7 @@
 use http::{HeaderMap, header::AUTHORIZATION};
 use validator::ValidationError;
 
-use super::AuthError;
+use super::error::{AuthError, TokenRejection};
 
 /// Extracts exactly one RFC 6750 bearer credential.
 ///
@@ -12,18 +12,24 @@ pub fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthError> {
     let mut values = headers.get_all(AUTHORIZATION).iter();
     let value = values.next().ok_or(AuthError::MissingCredentials)?;
     if values.next().is_some() {
-        return Err(AuthError::InvalidToken);
+        return Err(AuthError::InvalidToken(TokenRejection::DuplicateHeader));
     }
-    let value = value.to_str().map_err(|_| AuthError::InvalidToken)?;
+    let value = value
+        .to_str()
+        .map_err(|_| AuthError::InvalidToken(TokenRejection::NonUtf8Header))?;
     let token = value
         .strip_prefix("Bearer ")
-        .ok_or(AuthError::InvalidToken)?;
-    validate_compact_jwt(token).map_err(|_| AuthError::InvalidToken)?;
+        .ok_or(AuthError::InvalidToken(TokenRejection::Scheme))?;
+    if token.len() > 16_384 {
+        return Err(AuthError::InvalidToken(TokenRejection::Oversize));
+    }
+    validate_compact_jwt(token)
+        .map_err(|_| AuthError::InvalidToken(TokenRejection::CompactShape))?;
     Ok(token)
 }
 
 fn validate_compact_jwt(value: &str) -> Result<(), ValidationError> {
-    if value.len() > 16_384 || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+    if value.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return Err(ValidationError::new("jwt"));
     }
     let is_segment = |segment: &str| {

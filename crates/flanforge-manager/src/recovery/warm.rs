@@ -1,19 +1,21 @@
+use std::time::Duration;
+
 use flanforge_core::{
     Config, Profile, ProfileName, RetentionOutcome, RetentionPhase, RetentionResult, VmName,
     WarmImageRecord, WarmImageState,
 };
 
 use super::super::{
-    AllocationManager, ManagerError, ReapRequest,
+    AllocationManager, ManagerError, ReapRequest, WarmAvailability,
     reaper::{ReapAuthorization, reserved_image_names},
 };
 
 impl AllocationManager {
-    /// Reconciles each declaring profile's warm image against the listing.
+    /// Reconciles each declaring profile's warm image against the backend.
     /// Recovery never promotes a staged candidate: it cannot know whether that
-    /// candidate passed strip verification.
+    /// candidate passed its backend's pre-capture gates.
     pub(super) async fn ensure_warm_consistent(&self, config: &Config) -> Result<(), ManagerError> {
-        let machines = self.inner.worker.machines().await.unwrap_or_default();
+        let machines = self.inner.worker.machines().await?;
         let is_present =
             |name: &VmName| machines.iter().any(|machine| machine.name == name.as_str());
         for (name, profile) in &config.profiles {
@@ -23,12 +25,32 @@ impl AllocationManager {
             let Some(record) = self.inner.images.load(name).await? else {
                 continue;
             };
-            let (Ok(staging), Ok(previous)) = (record.staging_name(), record.previous_name())
-            else {
+            let (Ok(staging), Ok(_)) = (record.staging_name(), record.previous_name()) else {
                 tracing::error!(profile = %name, "warm image names are underivable; skipping reconciliation");
                 continue;
             };
-            let warm_present = is_present(&record.warm_template);
+            let warm_present = match self
+                .inner
+                .worker
+                .warm_availability(profile, &record, &machines)
+                .await
+            {
+                Ok(availability) => {
+                    matches!(
+                        availability,
+                        WarmAvailability::Ready | WarmAvailability::Busy
+                    )
+                }
+                Err(error) => {
+                    tracing::error!(profile = %name, %error, "warm image availability is unreadable; skipping reconciliation");
+                    continue;
+                }
+            };
+            // Dead by construction on a pointer-addressed backend: its listing
+            // reports domains, and a warm generation is a volume. Do not
+            // "fix" that by synthesizing machine entries for volumes — it
+            // would drag them into the sweep's prefix and age reasoning, which
+            // a volume has no counterpart to.
             let staging_present = is_present(&staging);
             if warm_present && staging_present && record.state == WarmImageState::Promoted {
                 tracing::warn!(profile = %name, "promotion was interrupted after it completed; removing the candidate");
@@ -43,8 +65,7 @@ impl AllocationManager {
                     tracing::error!(profile = %name, %error, "cannot revert the warm image record");
                 }
             } else if !warm_present {
-                self.restore_warm(name, profile, &record, is_present(&previous))
-                    .await;
+                self.restore_warm(name, profile, &record).await;
             }
             if staging_present {
                 self.delete_staged(name, profile, &record, &staging).await;
@@ -57,30 +78,18 @@ impl AllocationManager {
     }
 
     /// Rolls the record and the image back to the surviving generation. Only
-    /// reached with the live name absent, so the clone overwrites nothing; the
-    /// record reverts either way, because a record outliving its image costs a
-    /// cold boot while the reverse is a silent stale one.
-    async fn restore_warm(
-        &self,
-        name: &ProfileName,
-        profile: &Profile,
-        record: &WarmImageRecord,
-        previous_present: bool,
-    ) {
-        let Ok(previous) = record.previous_name() else {
-            return;
-        };
-        if previous_present {
-            if let Err(error) = self
-                .inner
-                .worker
-                .clone_image(&previous, &record.warm_template, profile)
-                .await
-            {
-                tracing::error!(profile = %name, %error, "cannot restore the previous warm image");
-            }
-        } else {
-            tracing::error!(profile = %name, "no warm image survives this profile; allocations boot cold");
+    /// reached with the live image unusable, so a name-addressed restore
+    /// overwrites nothing; the record reverts either way, because a record
+    /// outliving its image costs a cold boot while the reverse is a silent
+    /// stale one.
+    async fn restore_warm(&self, name: &ProfileName, profile: &Profile, record: &WarmImageRecord) {
+        if let Err(error) = self
+            .inner
+            .worker
+            .ensure_warm_restored(profile, record)
+            .await
+        {
+            tracing::error!(profile = %name, %error, "cannot restore the previous warm image");
         }
         if let Err(error) = self.revert_record(record).await {
             tracing::error!(profile = %name, %error, "cannot revert the warm image record");
@@ -104,7 +113,10 @@ impl AllocationManager {
                 authorization: &authorization,
                 profile: Some(profile),
                 record: Some(record),
+                // A staging image has no allocation and no registration.
+                allocation: None,
                 reserved: &reserved,
+                budget: self.teardown_budget(Duration::from_secs(profile.cleanup_timeout_seconds)),
             })
             .await
         {
@@ -120,25 +132,12 @@ impl AllocationManager {
     }
 
     async fn revert_record(&self, record: &WarmImageRecord) -> Result<(), ManagerError> {
-        match &record.previous {
-            Some(previous) => {
-                self.inner
-                    .images
-                    .save(&WarmImageRecord {
-                        profile: record.profile.clone(),
-                        warm_template: record.warm_template.clone(),
-                        generation: previous.generation,
-                        base_fingerprint: previous.base_fingerprint.clone(),
-                        produced_by: previous.produced_by,
-                        produced_at_unix: previous.produced_at_unix,
-                        state: WarmImageState::Promoted,
-                        previous: None,
-                    })
-                    .await?;
-            }
-            None => self.inner.images.remove(&record.profile).await?,
-        }
-        Ok(())
+        self.ensure_warm_reverted(
+            &record.profile,
+            &record.warm_template,
+            record.previous.as_ref(),
+        )
+        .await
     }
 
     /// Keeps the producing allocation's history honest about the interruption.
